@@ -1,0 +1,37 @@
+name: pay_plugin
+description: Flutter 支付插件，支持微信支付、支付宝支付、苹果内购
+version: 1.0.0
+homepage: https://github.com/WeiLanRobot/pay_kit
+repository: https://github.com/WeiLanRobot/pay_kit
+issue_tracker: https://github.com/WeiLanRobot/pay_kit/issues
+documentation: https://github.com/WeiLanRobot/pay_kit#readme
+
+environment:
+  sdk: ">=3.3.4 <4.0.0"
+  flutter: ">=3.19.6"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # iOS 内购
+  in_app_purchase: ^3.2.0
+  in_app_purchase_storekit: ^0.3.14
+
+  # 支付宝支付
+  alipay_payment: ^1.1.2
+
+  # 微信支付
+  wechat_bridge: ^1.1.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  assets:
+    - assets/icons/
+
+dependency_overrides:
+  http: ^1.2.2
