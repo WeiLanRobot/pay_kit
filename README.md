@@ -1,4 +1,4 @@
-# pay_plugin
+# pay_kit
 
 Flutter 支付插件，支持微信支付、支付宝支付、苹果内购（In-App Purchase）。
 
@@ -17,7 +17,7 @@ Flutter 支付插件，支持微信支付、支付宝支付、苹果内购（In-
 
 ```yaml
 dependencies:
-  pay_plugin:
+  pay_kit:
     git:
       url: https://github.com/WeiLanRobot/pay_kit.git
 ```
@@ -29,11 +29,10 @@ dependencies:
 在使用前需要注入配置：
 
 ```dart
-import 'package:pay_plugin/pay_plugin.dart';
+import 'package:pay_kit/pay_kit.dart';
 
-// 初始化配置
-PayPlugin.initialize(
-  DefaultPayPluginConfig(
+PayKit.initialize(
+  DefaultPayConfig(
     showToastHandler: (message, {isTip, lengthLong}) {
       // 你的 Toast 实现
     },
@@ -53,20 +52,20 @@ PayPlugin.initialize(
 ### 2. 微信支付
 
 ```dart
-final payPlugin = PayPlugin();
+final payKit = PayKit();
 
 // 检查微信是否安装
-final installed = await payPlugin.isWechatInstalled();
+final installed = await payKit.isWechatInstalled();
 
 // 发起支付
-await payPlugin.wechatKitPayOrder(
+await payKit.payWithWechat(
   appId: 'your_app_id',
   partnerId: 'your_partner_id',
   prepayId: 'your_prepay_id',
   nonceStr: 'your_nonce_str',
   timeStamp: 'your_timestamp',
   sign: 'your_sign',
-  (bool success, int code, String message) {
+  onResult: (bool success, int code, String message) {
     // 处理支付结果
   },
 );
@@ -75,16 +74,15 @@ await payPlugin.wechatKitPayOrder(
 ### 3. 支付宝支付
 
 ```dart
-final payPlugin = PayPlugin();
+final payKit = PayKit();
 
 // 检查支付宝是否安装
-final installed = await payPlugin.isAlipayInstalled();
+final installed = await payKit.isAlipayInstalled();
 
 // 发起支付
-await payPlugin.aliPayOrderKitOrder(
+await payKit.payWithAlipay(
   'your_order_info',
-  true, // 显示 Loading
-  (bool success, int code, String message) {
+  onResult: (bool success, int code, String message) {
     // 处理支付结果
   },
 );
@@ -93,12 +91,10 @@ await payPlugin.aliPayOrderKitOrder(
 ### 4. 苹果内购
 
 ```dart
-import 'package:pay_plugin/pay_plugin.dart';
-
-final buyEngine = BuyEngin();
+final buyEngine = BuyEngine();
 
 // 初始化内购
-buyEngine.initializeInAppPurchase((String receipt) {
+buyEngine.initialize((String receipt) {
   // 处理支付凭证，发送到服务器验证
 });
 
@@ -108,14 +104,14 @@ buyEngine.buyProduct('product_id', 'order_id');
 // 页面销毁时清理
 @override
 void dispose() {
-  buyEngine.onClose();
+  buyEngine.dispose();
   super.dispose();
 }
 ```
 
 ## 配置项
 
-### PayPluginConfig 接口
+### PayConfig 接口
 
 | 方法 | 说明 |
 |------|------|

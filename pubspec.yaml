@@ -1,4 +1,4 @@
-name: pay_plugin
+name: pay_kit
 description: Flutter 支付插件，支持微信支付、支付宝支付、苹果内购
 version: 1.0.0
 homepage: https://github.com/WeiLanRobot/pay_kit
