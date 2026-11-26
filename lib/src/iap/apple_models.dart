@@ -192,7 +192,14 @@ class AppleCharge {
       required this.conflict,
       this.reason});
   final String? transactionId, disposition, reference, reason;
-  final bool finishPending, conflict;
+
+  /// True until the SDK has recorded removal of every known StoreKit queue
+  /// item for this charge. Also true when no queue item has been observed.
+  /// If the app exits after removal but before recording it, this can stay
+  /// true. For an undisputed charge, show the server's [disposition] as soon
+  /// as it is available.
+  final bool finishPending;
+  final bool conflict;
 }
 
 /// Application-level recovery input. Keep this and raw receipts out of UI state.

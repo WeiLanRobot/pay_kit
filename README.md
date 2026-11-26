@@ -126,7 +126,9 @@ final snapshot = await account.buy(
 </array>
 ```
 
-**付款结果。** `snapshot.phase` 中的 `accepted` 表示商店已受理。`uncertain` 表示提交结果待确认，快照提供 `attemptId`。明确拒单、取消和失败分别为 `declined`、`canceled`、`failed`。已付款订单的 `charges` 分别报告每笔扣款的处置回执和队列收尾进度。队列暂时为空或服务端暂时查无记录时继续等待。
+**付款结果。** `snapshot.phase` 中的 `accepted` 表示商店已受理。`uncertain` 表示提交结果待确认，快照提供 `attemptId`。明确拒单、取消和失败分别为 `declined`、`canceled`、`failed`。已付款订单的 `charges` 分别报告每笔扣款的处置回执和队列收尾进度。尚无最终回执时，队列暂时为空或服务端暂时查无记录，仍需等待。
+
+对于无争议且已有服务端最终回执的扣款，页面按 `charge.disposition` 展示已发货（`delivered`）或已退款（`refunded`）。即使 `charge.finishPending` 为 `true`，也可以立即展示该结果。这个标志表示 SDK 还没有记录这笔扣款所有队列项的移除确认。如果 App 在 StoreKit 移除交易后、确认写入本地前退出，重启时的空队列无法补回这条确认，该标志可能一直为 `true`，相关收据也可能继续保留。
 
 **验单与发货。** 应用服务端核实应用、环境、SKU、数量、订单归属和每笔 Apple 交易，以经 Apple 核实的交易号幂等发货或退款。验单回调通过受信客户端获取结果，分别返回 `AppleVerification.delivered(AppleDisposition(...))`、`retryLater()`、`invalidEvidence()` 或 `needsReconciliation()`。最终回执同时绑定设备报告的交易号和服务端确认的交易号。多笔扣款分别处置。库先保存回执，再结束对应的原生队列项。网络恢复可调用 `await payments.retryPending()` 安排重试，取消或关闭支付页不会丢弃待验凭证。用户主动调用 `refreshReceipts()` 时系统可能要求 Apple ID 认证。
 

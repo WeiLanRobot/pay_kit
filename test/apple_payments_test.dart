@@ -191,6 +191,48 @@ void main() {
     expect(calls, 1);
     expect(store.finished.single.transactionId, 'T');
   });
+  test('a lost removal confirmation preserves delivery and permits a new order',
+      () async {
+    final verified = <String>[];
+    Future<AppleVerification> verify(AppleReceipt receipt) async {
+      verified.add(receipt.transactionId);
+      return delivered(receipt);
+    }
+
+    final first = login('A', verify);
+    final token = (await buy(first)).attemptId;
+    // StoreKit finishes the item, but the final journal write cannot commit.
+    store.afterFinish = () async {
+      (journal as FaultJournal).writable = false;
+    };
+    store.event(token, 'T');
+    await pay.settle();
+    expect(store.finished.map((item) => item.transactionId), ['T']);
+
+    await restart();
+    final current = login('A', verify);
+    // The removed transaction does not replay in the new store instance.
+    await drain();
+    await drain();
+    final charge = (await current.lookup('42'))!.charges.single;
+    expect(charge.disposition, 'delivered');
+    expect(charge.reference, 'ack-T');
+    expect(charge.finishPending, isTrue);
+    expect(verified, ['T']);
+    expect(store.finished, isEmpty);
+    expect(store.submitted, isEmpty);
+
+    final next = await buy(current, 'next-order');
+    expect(store.submitted, [next.attemptId]);
+    store.event(next.attemptId, 'T2');
+    await drain();
+    expect(verified, ['T', 'T2']);
+    expect(store.finished.map((item) => item.transactionId), ['T2']);
+    expect((await current.lookup('next-order'))!.charges.single.finishPending,
+        isFalse);
+    expect((await current.lookup('42'))!.charges.single.finishPending, isTrue);
+  });
+
   test('G3 disposal cannot transfer legacy receipt to surviving receiver',
       () async {
     final received = <String>[];
