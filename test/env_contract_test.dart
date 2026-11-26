@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -55,14 +56,14 @@ void main() {
     await dir.delete(recursive: true);
   });
   StoreEvent item(String handle, StoreStatus status,
-          {String? token, String? tx}) =>
+          {String? token, String? tx, String receipt = 'apple-receipt'}) =>
       StoreEvent(
           productId: 'sku',
           status: status,
           native: handle,
           transactionId: tx,
           queueId: tx,
-          receipt: status == StoreStatus.paid ? 'apple-receipt' : '',
+          receipt: status == StoreStatus.paid ? receipt : '',
           token: token);
   AppleClaim claim(String env, String order, String? token,
           {String? observation}) =>
@@ -277,6 +278,75 @@ void main() {
     await pay.start(environment: 'sandbox');
     expect(store.registrations, 1);
   });
+
+  for (final recover in [false, true]) {
+    test('detached legacy-only callback with managed recovery: $recover',
+        () async {
+      final entered = Completer<void>(), release = Completer<void>();
+      final owner = Object();
+      pay.attachLegacy(owner, (_) {
+        entered.complete();
+        return release.future;
+      }, (_, __) {}, (_) {});
+      try {
+        await pay.buyLegacy(owner, 'sku', 'legacy-first');
+        store.stream.add(
+            [item('legacy', StoreStatus.paid, token: 'legacy-first', tx: 'T')]);
+        await entered.future.timeout(const Duration(seconds: 4));
+        if (recover) {
+          store.stream.add([
+            item('legacy', StoreStatus.paid,
+                token: 'legacy-first', tx: 'T', receipt: 'updated-receipt')
+          ]);
+          // Wait for this replay while the original receiver still holds the callback.
+          final waiting = Stopwatch()..start();
+          while (await journal.read(
+                  (db) async => (await db.query('purchase_evidence')).length) <
+              2) {
+            if (waiting.elapsed >= const Duration(seconds: 4)) {
+              fail('The replay never reached the journal');
+            }
+            await Future<void>.delayed(const Duration(milliseconds: 1));
+          }
+        }
+        pay.detachLegacy(owner);
+        expect(store.finished, isEmpty);
+        if (recover) {
+          await pay
+              .start(environment: 'sandbox')
+              .timeout(const Duration(seconds: 4));
+          // A late legacy success cannot bypass verification after a claim.
+          await pay.reconcile(claim('sandbox', 'legacy-first', null));
+          release.complete();
+          await pay.settle().timeout(const Duration(seconds: 4));
+          expect(store.finished, isEmpty);
+          expect(
+              await journal.read((db) => db.query('legacy_handoff')), isEmpty);
+          final receipts = <String>[];
+          final account = pay.connect(
+              scope: 'A',
+              verify: (r) async {
+                receipts.add(r.receipt);
+                return delivered(r);
+              });
+          await pay.settle().timeout(const Duration(seconds: 4));
+          expect(receipts, hasLength(1));
+          expect(receipts.single, isIn(['apple-receipt', 'updated-receipt']));
+          expect(
+              (await account.lookup('legacy-first'))!.charges.single.reference,
+              'ack-T');
+          expect(store.finished.map((e) => e.native), ['legacy']);
+        }
+      } finally {
+        if (!release.isCompleted) release.complete();
+      }
+      await pay.settle();
+      expect(store.finished.map((e) => e.native), ['legacy']);
+      expect(await journal.read((db) => db.query('legacy_handoff')),
+          hasLength(recover ? 0 : 1));
+      expect(store.submitted, ['legacy-first']);
+    });
+  }
 
   test(
       'startup validates identity, buffers pending registration and releases failed owner',

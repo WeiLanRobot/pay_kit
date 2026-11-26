@@ -960,8 +960,7 @@ extension _AppleDelivery on ApplePayments {
       final body = e['body'] as String, hash = e['hash'] as String;
       final _CandidateResult step;
       if (scope == null) {
-        step = await _handoff(
-            id, attempt!, version, hash, body, p['token'] as String?);
+        step = await _handoff(p, attempt!, hash, body);
       } else {
         final receipt = AppleReceipt(
             scope: scope,
@@ -984,61 +983,109 @@ extension _AppleDelivery on ApplePayments {
     }
   }
 
-  Future<_CandidateResult> _handoff(String id, String attempt, int version,
-      String hash, String body, String? token) async {
+  Future<_CandidateResult> _handoff(
+      _Row purchase, String attempt, String hash, String body) async {
+    final id = purchase['id'] as String;
     final owner = _origin[attempt];
     final legacy = _legacy[owner];
-    if (legacy?.receive == null) return _CandidateResult.stop;
-    // Reserve inside the journal queue, mutually exclusive with trusted claim.
-    final reserved = await _journal.read((db) async {
-      final ready = await db.rawQuery('''
-        SELECT 1 FROM purchase p JOIN attempt a ON a.id=p.attemptId
+    if (owner == null || legacy?.receive == null) return _CandidateResult.stop;
+    final call = (owner: owner, detached: Completer<void>());
+    // A new receipt for this same charge may advance inputVersion while the
+    // host works. Check the actual authority and original evidence on return.
+    Future<bool> eligible(DatabaseExecutor db, {bool reserve = false}) async {
+      final rows = await db.rawQuery('''
+        SELECT p.reason,p.conflict,p.inputVersion,p.token,a.wireToken
+        FROM purchase p JOIN attempt a ON a.id=p.attemptId
         JOIN order_primary o ON o.purchaseId=p.id AND o.scope='' AND o.orderId=a.orderId
-        WHERE p.id=? AND p.attemptId=? AND p.scope IS NULL AND p.inputVersion=?
-          AND p.claimRef IS NULL AND p.disposition IS NULL AND p.conflict=0
-          AND a.legacySubmission='accepted'
+        JOIN purchase_evidence e ON e.purchaseId=p.id AND e.hash=?
+        WHERE p.id=? AND p.attemptId=? AND p.scope IS NULL
+          AND p.claimRef IS NULL AND p.disposition IS NULL AND p.reportedId=?
+          AND p.productId=a.productId AND p.orderId=a.orderId
+          AND e.storeObserved=1 AND e.rejected=0
+          AND a.mode='legacy' AND a.legacySubmission='accepted' AND a.phase='paid'
           AND NOT EXISTS(SELECT 1 FROM decision WHERE attemptId=a.id AND result!='conflict')
-        ''', [id, attempt, version]);
-      return ready.isNotEmpty &&
-          !_closed &&
-          identical(legacy, _legacy[owner]) &&
-          _legacyDelivering.add(id);
+        ''', [hash, id, attempt, purchase['reportedId']]);
+      final row = rows.firstOrNull;
+      return row != null &&
+          !_chargeOnHold(row) &&
+          !_disagrees(_wire(row['token'] as String?),
+              _wire(row['wireToken'] as String?)) &&
+          (!reserve || row['inputVersion'] == purchase['inputVersion']);
+    }
+
+    final reserved = await _journal.read((db) async {
+      if (!await eligible(db, reserve: true) ||
+          _closed ||
+          !identical(legacy, _legacy[owner]) ||
+          _legacyDelivering.containsKey(id)) {
+        return false;
+      }
+      _legacyDelivering[id] = call;
+      return true;
     });
     if (!reserved) return _CandidateResult.stop;
     try {
-      if (_closed || !identical(legacy, _legacy[owner])) {
+      if (_closed || call.detached.isCompleted) return _CandidateResult.stop;
+
+      Future<_CandidateResult> apply(bool received) async {
+        final applied = await _journal.write((db) async {
+          if (!await eligible(db) ||
+              _closed ||
+              (!received && call.detached.isCompleted)) {
+            return false;
+          }
+          if (!received) {
+            await db.update('purchase_evidence', {'tried': 1},
+                where: 'purchaseId=? AND hash=?', whereArgs: [id, hash]);
+            return true;
+          }
+          await db.insert('legacy_handoff',
+              {'purchaseId': id, 'attemptId': attempt, 'hash': hash});
+          await db.update(
+              'purchase', {'disposition': 'legacyHandedOff', 'reason': null},
+              where: 'id=?', whereArgs: [id]);
+          return true;
+        });
+        if (!applied) return _CandidateResult.stop;
+        if (!received) {
+          if (call.detached.isCompleted) return _CandidateResult.stop;
+          _report(StateError('Legacy receipt receiver requires retry'));
+          return _CandidateResult.retry;
+        }
+        _changed();
+        try {
+          if (!_closed && identical(legacy, _legacy[owner])) {
+            legacy!.status(purchase['token'] as String?, StoreStatus.paid);
+          }
+        } catch (_) {
+          _report(StateError('Legacy status receiver failed'));
+        }
+        _schedule(id);
         return _CandidateResult.stop;
       }
-      try {
-        await legacy!.receive!(body);
-      } catch (_) {
-        _report(StateError('Legacy receipt receiver requires retry'));
-        await _journal.write((db) => db.update(
-            'purchase_evidence', {'tried': 1},
-            where: 'purchaseId=? AND hash=?', whereArgs: [id, hash]));
-        return _CandidateResult.retry;
-      }
-      await _journal.write((db) async {
-        await db.insert('legacy_handoff',
-            {'purchaseId': id, 'attemptId': attempt, 'hash': hash},
-            conflictAlgorithm: ConflictAlgorithm.ignore);
-        await db.rawUpdate('''UPDATE purchase SET disposition='legacyHandedOff',
-            reason=CASE WHEN conflict=0 THEN NULL ELSE reason END
-            WHERE id=? AND disposition IS NULL AND scope IS NULL AND attemptId=?''',
-            [id, attempt]);
-      });
-      _changed();
-      try {
-        if (identical(legacy, _legacy[owner])) {
-          legacy.status(token, StoreStatus.paid);
+
+      final response = Future.sync(() => legacy!.receive!(body))
+          .then((_) => true, onError: (Object _) => false)
+          .then((received) {
+        if (_closed || (!received && call.detached.isCompleted)) {
+          return Future.value(_CandidateResult.stop);
         }
-      } catch (_) {
-        _report(StateError('Legacy status receiver failed'));
-      }
-      await _finishPurchase(id);
-      return _CandidateResult.stop;
+        final applying = apply(received).catchError((Object error) {
+          _report(error);
+          _retryLater(id);
+          return _CandidateResult.stop;
+        });
+        _responding.add(applying);
+        return applying.whenComplete(() => _responding.remove(applying));
+      });
+      return await Future.any([
+        response,
+        call.detached.future.then((_) => _CandidateResult.stop),
+      ]);
     } finally {
-      _legacyDelivering.remove(id);
+      if (identical(_legacyDelivering[id]?.detached, call.detached)) {
+        _legacyDelivering.remove(id);
+      }
     }
   }
 
@@ -1351,8 +1398,8 @@ extension _AppleDelivery on ApplePayments {
             limit: 1))
         .firstOrNull;
     final canonical = verifiedRow ?? p;
-    if (_legacyDelivering.contains(p['id']) ||
-        _legacyDelivering.contains(canonical['id'])) {
+    if (_legacyDelivering.containsKey(p['id']) ||
+        _legacyDelivering.containsKey(canonical['id'])) {
       throw StateError('Legacy receipt handoff in progress');
     }
     final target = canonical['id'] as String;
@@ -1441,8 +1488,8 @@ extension _AppleDelivery on ApplePayments {
             whereArgs: [c.appId, c.environment, c.verifiedTransactionId]))
         .firstOrNull;
     final canonical = verified ?? p;
-    if (_legacyDelivering.contains(p['id']) ||
-        _legacyDelivering.contains(canonical['id'])) {
+    if (_legacyDelivering.containsKey(p['id']) ||
+        _legacyDelivering.containsKey(canonical['id'])) {
       throw StateError('Legacy receipt handoff in progress');
     }
     final ack = c.disposition;

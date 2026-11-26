@@ -65,7 +65,10 @@ AppleVerification ack(AppleReceipt r,
 }
 
 AppleClaim claim(String reported,
-        {String? verified, String order = 'order', String? token}) =>
+        {String? verified,
+        String order = 'order',
+        String? token,
+        AppleDisposition? disposition}) =>
     AppleClaim(
         appId: 'app',
         environment: 'sandbox',
@@ -75,7 +78,8 @@ AppleClaim claim(String reported,
         reportedTransactionId: reported,
         verifiedTransactionId: verified ?? reported,
         reference: 'claim-$reported',
-        purchaseToken: token);
+        purchaseToken: token,
+        disposition: disposition);
 
 AppleAttemptDecision recovery(
         String id, String order, AppleAttemptOutcome outcome,
@@ -97,10 +101,11 @@ void main() {
   late Directory dir;
   late ApplePayments payments;
   late _Store store;
+  late AppleJournal journal;
   Future<void> start() async {
     store = _Store();
-    payments = ApplePayments.forTesting(
-        store, AppleJournal(() async => File('${dir.path}/ledger')));
+    journal = AppleJournal(() async => File('${dir.path}/ledger'));
+    payments = ApplePayments.forTesting(store, journal);
     await payments.start(environment: 'sandbox');
   }
 
@@ -550,27 +555,108 @@ void main() {
     expect(store.finished.map((e) => e.transactionId), ['first', 'second']);
   });
 
-  test(
-      'claim cannot race an async original legacy handoff after its page has detached',
-      () async {
-    final entered = Completer<void>(), release = Completer<void>();
-    final owner = Object();
-    payments.attachLegacy(owner, (r) async {
-      entered.complete();
-      await release.future;
-    }, (_, __) {}, (_) {});
-    await payments.buyLegacy(owner, 'coins', 'order');
-    store.paid('order', 'first');
-    await entered.future;
-    payments.detachLegacy(owner);
-    try {
-      await expectLater(payments.reconcile(claim('first')), throwsStateError);
-    } finally {
-      release.complete();
-    }
-    await payments.settle();
-    expect(store.finished.single.transactionId, 'first');
-  });
+  for (final detach in [true, false]) {
+    test(
+        'same queue gains its order token during legacy handoff (detached: $detach)',
+        () async {
+      final owner = Object(),
+          entered = Completer<void>(),
+          release = Completer<void>();
+      final receipts = <String>[];
+      payments.attachLegacy(owner, (receipt) {
+        receipts.add(receipt);
+        if (!entered.isCompleted) entered.complete();
+        return release.future;
+      }, (_, __) {}, (_) {});
+      await payments.buyLegacy(owner, 'coins', 'O');
+      store.updates.add([
+        const StoreEvent(
+            productId: 'coins',
+            status: StoreStatus.pending,
+            queueId: 'Q',
+            native: 'original',
+            token: 'O'),
+      ]);
+      store.paid(null, 'T', queue: 'Q', handle: 'original');
+      try {
+        await entered.future.timeout(const Duration(seconds: 4));
+        if (detach) payments.detachLegacy(owner);
+        store.paid('O', 'T', queue: 'Q', handle: 'original');
+        // Wait for the StoreKit update to commit while the receiver is still suspended.
+        await Stream.periodic(const Duration(milliseconds: 10))
+            .asyncMap((_) => journal.read((db) => db.query('purchase',
+                columns: ['token'], where: 'reportedId=?', whereArgs: ['T'])))
+            .firstWhere((rows) => rows.single['token'] == 'O')
+            .timeout(const Duration(seconds: 4));
+        expect(store.finished, isEmpty);
+      } finally {
+        release.complete();
+      }
+      await payments.settle().timeout(const Duration(seconds: 4));
+      expect(receipts, ['receipt']);
+      expect(store.finished.map((e) => (e.queueId, e.transactionId, e.native)),
+          [('Q', 'T', 'original')]);
+    });
+  }
+
+  for (final lateFailure in [false, true]) {
+    test(
+        'detached handoff cannot override trusted settlement (late failure: $lateFailure)',
+        () async {
+      final entered = Completer<void>(), release = Completer<void>();
+      final owner = Object();
+      payments.attachLegacy(owner, (_) {
+        entered.complete();
+        return release.future;
+      }, (_, __) {}, (_) {});
+      final verified = <String>[], errors = <Object>[];
+      final subscription = payments.errors.listen(errors.add);
+      addTearDown(subscription.cancel);
+      final account = payments.connect(
+          scope: 'A',
+          verify: (r) async {
+            verified.add(r.transactionId);
+            return ack(r);
+          });
+      const disposition = AppleDisposition(
+          appId: 'app',
+          environment: 'sandbox',
+          scope: 'A',
+          orderId: 'order',
+          productId: 'coins',
+          reportedTransactionId: 'T',
+          verifiedTransactionId: 'T',
+          reference: 'already-refunded',
+          outcome: AppleOutcome.refunded);
+      final recovery = claim('T', disposition: disposition);
+      try {
+        await payments.buyLegacy(owner, 'coins', 'order');
+        store.paid('order', 'T', handle: 'original');
+        await entered.future.timeout(const Duration(seconds: 4));
+        // An attached receiver keeps its exclusive handoff while the callback is running.
+        await expectLater(payments.reconcile(recovery), throwsStateError);
+        payments.detachLegacy(owner);
+        await payments.reconcile(recovery).timeout(const Duration(seconds: 4));
+        await payments.settle().timeout(const Duration(seconds: 4));
+        expect(store.finished.map((e) => e.native), ['original']);
+        expect((await account.lookup('order'))!.charges.single.reference,
+            'already-refunded');
+      } finally {
+        if (lateFailure) {
+          release.completeError(StateError('expired page'));
+        } else {
+          release.complete();
+        }
+      }
+      await payments.settle();
+      expect((await account.lookup('order'))!.charges.single.disposition,
+          'refunded');
+      expect(await journal.read((db) => db.query('legacy_handoff')), isEmpty);
+      expect(verified, isEmpty);
+      expect(errors, isEmpty);
+      expect(store.finished.map((e) => e.native), ['original']);
+    });
+  }
 
   test(
       'unpaid fact commits before exact native cleanup, including failed finish and restart',

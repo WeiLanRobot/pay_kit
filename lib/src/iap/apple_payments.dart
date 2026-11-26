@@ -108,7 +108,9 @@ class ApplePayments {
   final _errors = StreamController<Object>.broadcast();
   final _legacy = <Object, _Legacy>{};
   final _origin = <String, Object>{};
-  final _legacyDelivering = <String>{};
+  final _legacyDelivering =
+      <String, ({Object owner, Completer<void> detached})>{};
+  final _retiringHandoffs = <Future<void>>{};
   final _legacyBusy = <Object, String>{};
   final _launches = <(String?, String), _Launch>{};
   final _live = <String, StoreEvent>{};
@@ -142,7 +144,7 @@ class ApplePayments {
   final _currentUnbound = <String, StoreEvent>{};
   final _observedHere = <String>{};
   List<StoreEvent>? _buffer;
-  final _heldWork = <String>{};
+  final _queuedWork = <String>{};
   bool _ready = false, _managedRequested = false;
 
   /// Use the running application's bundle identifier in the selected store environment.
@@ -165,34 +167,39 @@ class ApplePayments {
   }
 
   Future<void> _configure(String environment) async {
-    final app = await _store.bundleIdentifier();
-    if (app.trim().isEmpty) {
-      throw StateError('Missing StoreKit application identity');
-    }
-    _appId = app;
     final legacyBoot = _boot;
-    if (legacyBoot != null) await legacyBoot;
+    if (!_ready && legacyBoot != null) await legacyBoot;
     if (_closed) throw StateError('Apple payments closed');
-    if (_ready) {
-      // A legal legacy session remains the owner if managed binding fails.
-      // Never await a host callback or native call that may itself request start.
-      _buffer = [];
-      try {
-        await _events;
-        if (_launches.isNotEmpty ||
-            _workers.isNotEmpty ||
-            _closingItems.isNotEmpty ||
-            _launchResults.isNotEmpty) {
-          throw StateError(
-              'Legacy payment work in progress; retry managed startup');
-        }
-        await _journal.select(app, environment, handoff: _submittedHere);
-        _configured = true;
-      } finally {
-        _drainBuffer();
+    final upgrading = _ready;
+    // Freeze queued work before the first platform await. Only work that has
+    // already started may still be using the compatibility journal.
+    if (upgrading) _buffer = [];
+    try {
+      final app = await _store.bundleIdentifier();
+      if (app.trim().isEmpty) {
+        throw StateError('Missing StoreKit application identity');
       }
-    } else {
-      await _open(app, environment);
+      if (_closed) throw StateError('Apple payments closed');
+      _appId = app;
+      if (!upgrading) {
+        await _open(app, environment);
+        return;
+      }
+      await _events;
+      // A detached host no longer owns its worker. Drain its released turn,
+      // without waiting for a native call or host that could itself request start.
+      await Future.wait(_retiringHandoffs);
+      if (_launches.isNotEmpty ||
+          _workers.isNotEmpty ||
+          _closingItems.isNotEmpty ||
+          _launchResults.isNotEmpty) {
+        throw StateError(
+            'Legacy payment work in progress; retry managed startup');
+      }
+      await _journal.select(app, environment, handoff: _submittedHere);
+      _configured = true;
+    } finally {
+      if (upgrading) _drainBuffer();
     }
   }
 
@@ -218,8 +225,8 @@ class ApplePayments {
     for (final event in buffered ?? const <StoreEvent>[]) {
       _queueEvent(event);
     }
-    final work = _heldWork.toList();
-    _heldWork.clear();
+    final work = _queuedWork.toList();
+    _queuedWork.clear();
     for (final id in work) {
       _schedule(id);
     }
@@ -362,6 +369,16 @@ class ApplePayments {
   @internal
   void detachLegacy(Object owner) {
     _legacy.remove(owner);
+    _legacyDelivering.removeWhere((id, call) {
+      if (!identical(call.owner, owner)) return false;
+      final worker = _workers[id];
+      if (worker != null) {
+        _retiringHandoffs.add(worker);
+        unawaited(worker.whenComplete(() => _retiringHandoffs.remove(worker)));
+      }
+      call.detached.complete();
+      return true;
+    });
     _legacyBusy.remove(owner);
     _origin.removeWhere((_, value) => identical(value, owner));
   }
@@ -717,30 +734,28 @@ class ApplePayments {
 
   void _schedule(String id) {
     if (_closed) return;
-    if (_buffer != null) {
-      _heldWork.add(id);
-      return;
-    }
     if (_workers.containsKey(id)) {
       _dirty.add(id);
       _checkCalls();
       return;
     }
-    _workers[id] = Future<void>(() async {
-      try {
-        do {
-          _dirty.remove(id);
-          try {
-            await _processPurchase(id);
-          } catch (error) {
-            _report(error);
-            _retryLater(id);
-          }
-        } while (!_closed && _dirty.remove(id));
-      } finally {
-        _workers.remove(id);
-      }
+    if (!_queuedWork.add(id) || _buffer != null) return;
+    scheduleMicrotask(() {
+      if (_closed || _buffer != null || !_queuedWork.remove(id)) return;
+      _workers[id] = _runPurchase(id);
     });
+  }
+
+  Future<void> _runPurchase(String id) async {
+    try {
+      await _processPurchase(id);
+    } catch (error) {
+      _report(error);
+      _retryLater(id);
+    } finally {
+      _workers.remove(id);
+      if (_dirty.remove(id)) _schedule(id);
+    }
   }
 
   /// Enqueue existing work. This may safely be called from the verifier itself.
@@ -1087,6 +1102,10 @@ class ApplePayments {
   Future<void> close() async {
     _closed = true;
     _ready = false;
+    for (final call in _legacyDelivering.values) {
+      call.detached.complete();
+    }
+    _legacyDelivering.clear();
     _account?.dispose();
     await _subscription?.cancel();
     for (final timer in _timers.values) {
