@@ -2,7 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:pay_kit/pay_kit.dart';
 
-Future<void> main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
 
   // 初始化支付插件
@@ -23,14 +23,17 @@ Future<void> main() async {
     ),
   );
 
-  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
-    await ApplePayments.instance.start(environment: 'sandbox');
-  }
-  runApp(const MyApp());
+  runApp(MyApp(
+    applePayments: !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS
+        ? ApplePayments.instance
+        : null,
+  ));
 }
 
 class MyApp extends StatefulWidget {
-  const MyApp({super.key});
+  const MyApp({super.key, required this.applePayments});
+
+  final ApplePayments? applePayments;
 
   @override
   State<MyApp> createState() => _MyAppState();
@@ -38,13 +41,23 @@ class MyApp extends StatefulWidget {
 
 class _MyAppState extends State<MyApp> {
   AppleAccount? _account;
+  bool _startingApple = false;
 
   @override
   void initState() {
     super.initState();
-    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+    _startApple();
+  }
+
+  Future<void> _startApple() async {
+    final payments = widget.applePayments;
+    if (payments == null || _startingApple || _account != null) return;
+    setState(() => _startingApple = true);
+    try {
+      await payments.start(environment: 'sandbox');
+      if (!mounted) return;
       // 示例模拟已登录账号。实际应用在登录时传入稳定的账号 ID，在退出时 dispose。
-      _account = ApplePayments.instance.connect(
+      _account = payments.connect(
         scope: 'demo-account',
         verify: (AppleReceipt receipt) async {
           // 将 scope、orderId、productId、transactionId 和 receipt 交给业务服务端。
@@ -52,7 +65,10 @@ class _MyAppState extends State<MyApp> {
           return const AppleVerification.retryLater();
         },
       );
+    } catch (error) {
+      debugPrint('苹果内购启动失败（${error.runtimeType}）');
     }
+    if (mounted) setState(() => _startingApple = false);
   }
 
   @override
@@ -69,15 +85,29 @@ class _MyAppState extends State<MyApp> {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
         useMaterial3: true,
       ),
-      home: PayPage(account: _account),
+      home: PayPage(
+        account: _account,
+        startingApple: _startingApple,
+        retryApple:
+            widget.applePayments != null && !_startingApple && _account == null
+                ? _startApple
+                : null,
+      ),
     );
   }
 }
 
 class PayPage extends StatefulWidget {
-  const PayPage({super.key, required this.account});
+  const PayPage({
+    super.key,
+    required this.account,
+    this.startingApple = false,
+    this.retryApple,
+  });
 
   final AppleAccount? account;
+  final bool startingApple;
+  final VoidCallback? retryApple;
 
   @override
   State<PayPage> createState() => _PayPageState();
@@ -158,10 +188,16 @@ class _PayPageState extends State<PayPage> {
             const Text('苹果内购',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
-            ElevatedButton(
-              onPressed: widget.account == null ? null : _buyIAP,
-              child: const Text('购买商品 (iOS)'),
-            ),
+            if (widget.retryApple != null)
+              ElevatedButton(
+                onPressed: widget.retryApple,
+                child: const Text('苹果内购启动失败，点击重试'),
+              )
+            else
+              ElevatedButton(
+                onPressed: widget.account == null ? null : _buyIAP,
+                child: Text(widget.startingApple ? '正在启动苹果内购…' : '购买商品 (iOS)'),
+              ),
           ],
         ),
       ),
