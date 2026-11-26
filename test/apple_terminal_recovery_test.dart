@@ -31,12 +31,18 @@ void main() {
   late ProbeStore store;
   Future<void> open(
       {ProbeStore? testStore,
+      bool legacyOnly = false,
       Timer Function(Duration, void Function())? timerFactory}) async {
     store = testStore ?? ProbeStore();
     journal = AppleJournal(() async => File('${directory.path}/ledger'));
     payments =
         ApplePayments.forTesting(store, journal, timerFactory: timerFactory);
-    await payments.start(environment: 'sandbox');
+    if (legacyOnly) {
+      payments.attachLegacy(Object(), null, (_, __) {}, (_) {});
+      await payments.retryPending();
+    } else {
+      await payments.start(environment: 'sandbox');
+    }
   }
 
   Future<void> stop() async {
@@ -49,6 +55,21 @@ void main() {
   StoreEvent event(StoreStatus status, String handle,
           {String? token, String sku = 'sku'}) =>
       StoreEvent(native: handle, productId: sku, status: status, token: token);
+
+  StoreEvent offCatalog(StoreStatus status, String handle, String? order,
+          {String sku = 'sku'}) =>
+      StoreEvent(
+          native: handle,
+          productId: sku,
+          token: order,
+          status: status,
+          allowsUnownedFinish: false);
+
+  Future<void> submitLegacy(String order) {
+    final owner = Object();
+    payments.attachLegacy(owner, (_) async {}, (_, __) {}, (_) {});
+    return payments.buyLegacy(owner, 'sku', order);
+  }
 
   setUp(() async {
     directory = await Directory.systemTemp.createTemp('paykit-terminal');
@@ -88,6 +109,143 @@ void main() {
       expect(store.submitted, [next.attemptId]);
     });
   }
+
+  for (final status in [StoreStatus.canceled, StoreStatus.failed]) {
+    for (final legacyOnly in [false, true]) {
+      test(
+          'catalog removal still permits legacy ${status.name} cleanup (legacy-only: $legacyOnly)',
+          () async {
+        await open(legacyOnly: legacyOnly);
+        await submitLegacy('order-123');
+        await stop();
+        await open(legacyOnly: legacyOnly);
+
+        // The old business token is the only queue identifier available at replay.
+        final target = offCatalog(status, 'owned', 'order-123');
+        store.stream.add([
+          offCatalog(status, 'foreign', 'other-order'),
+          offCatalog(status, 'different-product', 'order-123', sku: 'other'),
+          offCatalog(status, 'missing-token', null),
+          target,
+        ]);
+        await payments.settle();
+        store.stream.add([target]);
+        await payments.retryPending();
+        await payments.settle();
+        expect(store.finished, [same(target)]);
+        final attempt = await journal.read((db) async => (await db
+                .query('attempt', where: 'orderId=?', whereArgs: ['order-123']))
+            .single);
+        expect(attempt['phase'], 'accepted');
+      });
+    }
+  }
+
+  test('off-catalog cleanup preserves an existing server unpaid decision',
+      () async {
+    await open();
+    await submitLegacy('order-123');
+    final attempt = (await payments.unresolvedAttempts()).single;
+    await payments.resolveAttempt(AppleAttemptDecision(
+        issuer: 'server',
+        decisionId: 'unpaid',
+        appId: 'app',
+        environment: 'sandbox',
+        scope: 'A',
+        orderId: 'order-123',
+        attemptId: attempt.attemptId,
+        reference: 'closed-by-server',
+        outcome: AppleAttemptOutcome.unpaid));
+    await stop();
+    await open();
+
+    final target = offCatalog(StoreStatus.canceled, 'old-item', 'order-123');
+    store.stream.add([target]);
+    await payments.settle();
+    expect(store.finished, [same(target)]);
+    final original = await journal.read((db) async => (await db
+            .query('attempt', where: 'id=?', whereArgs: [attempt.attemptId]))
+        .single);
+    expect(original['phase'], 'declined');
+    expect(original['reason'], 'serverUnpaid');
+  });
+
+  test('off-catalog legacy failures require confirmed, unambiguous ownership',
+      () async {
+    await open();
+    store.launch = () async => false;
+    await expectLater(
+        submitLegacy('declined'), throwsA(isA<StorePurchaseRejected>()));
+    store.launch = () async => throw StateError('lost reply');
+    await expectLater(
+        submitLegacy('uncertain'), throwsA(isA<StoreSubmissionUnresolved>()));
+    store.launch = null;
+    await submitLegacy('ambiguous');
+    await submitLegacy('payment-observed');
+    await submitLegacy('other-accepted-order');
+    await stop();
+    await open();
+
+    // Older ledgers may have reserved the same token in different partitions.
+    await journal.write((db) => db.insert('recovery.submission', {
+          'token': 'ambiguous',
+          'origin': 'production',
+          'attemptId': 'another-attempt'
+        }));
+    store.event('payment-observed', 'payment');
+    await payments.settle();
+    // This token has its own accepted order, but the queue ID identifies the
+    // payment already observed for a different order.
+    store.stream.add([
+      const StoreEvent(
+          native: 'conflicting-item',
+          productId: 'sku',
+          token: 'other-accepted-order',
+          queueId: 'payment',
+          status: StoreStatus.failed,
+          allowsUnownedFinish: false),
+    ]);
+    for (final order in [
+      'declined',
+      'uncertain',
+      'ambiguous',
+      'payment-observed'
+    ]) {
+      store.stream
+          .add([offCatalog(StoreStatus.failed, 'failure-$order', order)]);
+    }
+    await payments.settle();
+    await payments.retryPending();
+    await payments.settle();
+    expect(store.finished, isEmpty);
+  });
+
+  test('new payment evidence stops a pending off-catalog finish retry',
+      () async {
+    await open();
+    await submitLegacy('order-123');
+    await stop();
+    final native = _RetryStore();
+    await open(
+        testStore: native,
+        timerFactory: (_, callback) =>
+            Timer(const Duration(days: 1), callback));
+
+    store.stream.add([offCatalog(StoreStatus.failed, 'old-item', 'order-123')]);
+    try {
+      await native.firstCall.future.timeout(const Duration(seconds: 4));
+    } finally {
+      native.failFirst.complete();
+    }
+    await payments.settle();
+
+    store.event('order-123', 'late-payment');
+    await payments.settle();
+    await payments.retryPending();
+    await payments.settle();
+    expect(native.calls, 1);
+    expect(native.finished, isEmpty);
+  });
 
   for (final blocked in [
     'no token',

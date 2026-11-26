@@ -31,34 +31,101 @@ extension _AppleEnvironment on ApplePayments {
             .contains(a['phase'])) {
       return false;
     }
+    return _failureMatchesSubmission(db, e, a, _environment!);
+  }
+
+  Future<bool> _failureMatchesSubmission(
+      DatabaseExecutor db, StoreEvent e, _Row a, String origin) async {
+    final token = _wire(e.token);
     final reservations = await db.query('recovery.submission',
-        where: 'token=?', whereArgs: [a['id']], limit: 2);
+        where: 'token=?', whereArgs: [token], limit: 2);
     if (reservations.length != 1 ||
-        reservations.single['origin'] != _environment ||
+        reservations.single['origin'] != origin ||
         reservations.single['attemptId'] != a['id']) {
+      return false;
+    }
+    // Opaque legacy order IDs require checking any stable StoreKit IDs across
+    // observations, as well as the current handle and the exact submitted token.
+    final reported = _present(e.transactionId);
+    final legacyReported = origin == 'legacy' ? reported : null;
+    final legacyQueue = origin == 'legacy' ? _present(e.queueId) : null;
+    if (legacyReported != null &&
+        await _reportedPurchase(db, legacyReported) != null) {
       return false;
     }
     final contradictory = await db.rawQuery('''
       SELECT 1 FROM purchase WHERE attemptId=? OR token=?
       UNION ALL SELECT 1 FROM recovery.observation WHERE
         (token=? AND (status='paid' OR reason='identityConflict')) OR
-        (generation=? AND objectKey=? AND
+        (((generation=? AND objectKey=?) OR queueId=? OR reportedId=?) AND
           (reason='identityConflict' OR productId!=? OR
            (token IS NOT NULL AND token!=?) OR
+           (queueId IS NOT NULL AND queueId!=?) OR
            (reportedId IS NOT NULL AND reportedId!=?) OR
            (status!='pending' AND status!=?)))
       LIMIT 1''', [
       a['id'],
-      a['id'],
-      a['id'],
+      token,
+      token,
       _generation,
       _objectKey(e),
+      legacyQueue,
+      legacyReported,
       e.productId,
-      a['id'],
-      _present(e.transactionId),
+      token,
+      legacyQueue,
+      reported,
       e.status.name
     ]);
     return contradictory.isEmpty;
+  }
+
+  // A terminal queue item may belong to a product removed from the catalog.
+  // This check authorizes removing the object, without settling a legacy order.
+  Future<bool> _ownsUnboundFailure(
+      DatabaseExecutor db, StoreEvent e, _Row? attempt) async {
+    if (e.allowsUnownedFinish) return true;
+    final token = _wire(e.token);
+    final matchesProduct =
+        attempt != null && attempt['productId'] == e.productId;
+    if (matchesProduct && Uuid.isValidUUID(fromString: token ?? '')) {
+      return true;
+    }
+    final queueId = _present(e.queueId);
+    final reported = _present(e.transactionId);
+    if (queueId != null) {
+      final recorded = (await db.query('queue_item',
+              where: 'storeQueueId=?', whereArgs: [queueId], limit: 1))
+          .firstOrNull;
+      if (recorded != null) {
+        if (recorded['productId'] != e.productId ||
+            recorded['status'] == 'paid' ||
+            _disagrees(recorded['token'], token) ||
+            _disagrees(recorded['attemptId'], attempt?['id']) ||
+            _disagrees(recorded['reportedId'], reported)) {
+          return false;
+        }
+        if (recorded['attemptId'] != null) {
+          return reported == null ||
+              await _reportedPurchase(db, reported) == null;
+        }
+      }
+    }
+    if (!matchesProduct ||
+        attempt['mode'] != 'legacy' ||
+        attempt['legacySubmission'] != 'accepted' ||
+        attempt['orderId'] != token ||
+        attempt['submittedId'] != null) {
+      return false;
+    }
+    final phase = attempt['phase'];
+    final serverUnpaid =
+        phase == 'declined' && attempt['reason'] == 'serverUnpaid';
+    if (!const {'accepted', 'pending', 'failed', 'canceled'}.contains(phase) &&
+        !serverUnpaid) {
+      return false;
+    }
+    return _failureMatchesSubmission(db, e, attempt, 'legacy');
   }
 
   /// An observation without a submission from this process has application,
@@ -73,19 +140,8 @@ extension _AppleEnvironment on ApplePayments {
       }
       final terminalFailure =
           e.status == StoreStatus.canceled || e.status == StoreStatus.failed;
-      final recordedQueue = terminalFailure && _present(e.queueId) != null
-          ? (await db.query('queue_item',
-                  where:
-                      'storeQueueId=? AND productId=? AND attemptId IS NOT NULL',
-                  whereArgs: [e.queueId, e.productId]))
-              .firstOrNull
-          : null;
-      final ownsFailure = terminalFailure &&
-          (e.allowsUnownedFinish ||
-              a != null &&
-                  a['productId'] == e.productId &&
-                  Uuid.isValidUUID(fromString: _wire(e.token) ?? '') ||
-              recordedQueue != null);
+      final ownsFailure =
+          terminalFailure && await _ownsUnboundFailure(db, e, a);
       final context = _configured ? _environment! : 'compat';
       final priorCharge =
           await _reportedPurchase(db, _present(e.transactionId));
@@ -187,6 +243,12 @@ extension _AppleEnvironment on ApplePayments {
                AND finished=0 AND reason='ownedFailure'""",
             [id, _generation, _objectKey(e), e.status.name]);
         if (permitted.isEmpty) return null;
+        // A delayed retry can run after new payment or conflict evidence arrived.
+        if (!e.allowsUnownedFinish &&
+            !await _ownsUnboundFailure(
+                db, e, await _attemptForToken(db, _wire(e.token)))) {
+          return null;
+        }
         await _recordFinishAuthority(db, e, itemId: id);
         return e;
       });
