@@ -92,6 +92,8 @@ await payKit.payWithAlipay(
 
 适用于 iOS StoreKit 1 消耗型内购。应用启动时在主 Flutter engine 建立唯一队列观察者。登录层为当前账号绑定独立的验单客户端，支付页通过同一个账号句柄下单或订阅订单。
 
+Flutter 调试时，热重启（hot restart）会重建 Dart 状态，但同一 Flutter engine 可能仍持有原账本连接和 StoreKit 观察者。如果热重启后启动内购时报 `database is locked` 或 `storekit_writer_conflict`，请停止当前调试运行，再重新运行 App。
+
 ```dart
 final payments = ApplePayments.instance;
 await payments.start(environment: storeEnvironment);
