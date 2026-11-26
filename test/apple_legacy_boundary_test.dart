@@ -108,6 +108,31 @@ void main() {
     expect(received, isEmpty);
   });
 
+  test('a late payment on a canceled order blocks its receiver again',
+      () async {
+    await start(AppleJournal(() async => File('${directory.path}/ledger')),
+        (receipt) {});
+    page.buyProduct('sku', 'first');
+    await dismissed.future;
+    store.event('first', null, queue: 'cancel', status: StoreStatus.canceled);
+    await payments.settle();
+
+    dismissed = Completer();
+    page.buyProduct('sku', 'second');
+    await dismissed.future;
+    store.event('second', 'second-charge');
+    await payments.settle();
+    expect(store.submitted, ['first', 'second']);
+
+    store.event('first', 'late-charge');
+    await payments.settle();
+    expect((await payments.unmatched()).single.reason, 'paymentAfterUnpaid');
+    dismissed = Completer();
+    page.buyProduct('sku', 'third');
+    await dismissed.future;
+    expect(store.submitted, ['first', 'second']);
+  });
+
   for (final reply in ['accepted', 'declined', 'uncertain']) {
     for (final status in StoreStatus.values) {
       test('early ${status.name} with native reply $reply', () async {

@@ -496,16 +496,23 @@ class ApplePayments {
         );
       }
       if (owner != null) {
-        for (final entry in _origin.entries
-            .where((e) => identical(e.value, owner))
-            .toList()) {
+        final attempts = [
+          for (final entry in _origin.entries)
+            if (identical(entry.value, owner)) entry.key,
+        ];
+        // Older SQLite builds allow at most 999 bound parameters per statement.
+        const batchSize = 999;
+        for (var offset = 0; offset < attempts.length; offset += batchSize) {
+          final ids = attempts.skip(offset).take(batchSize).toList();
+          final placeholders = List.filled(ids.length, '?').join(',');
           final unresolved = await db.rawQuery('''
-            SELECT id FROM attempt a WHERE id=? AND legacySubmission IS NOT 'declined'
+            SELECT 1 FROM attempt a WHERE a.id IN ($placeholders) AND legacySubmission IS NOT 'declined'
             AND phase NOT IN ('canceled','failed','declined') AND NOT EXISTS (
                 SELECT 1 FROM purchase p WHERE p.attemptId=a.id AND p.conflict=0 AND
                   (p.disposition='legacyHandedOff' OR
                    (p.claimRef IS NOT NULL AND p.verifiedId IS NOT NULL AND p.disposition IS NOT NULL)))
-          ''', [entry.key]);
+            LIMIT 1
+          ''', ids);
           if (unresolved.isNotEmpty) {
             throw const StoreSubmissionUnresolved();
           }
