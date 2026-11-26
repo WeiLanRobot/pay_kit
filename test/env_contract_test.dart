@@ -359,6 +359,40 @@ void main() {
     expect(store.submitted, ['legacy-order']);
   });
 
+  test('legacy purchases retry the failed managed environment once', () async {
+    store.reject = true;
+    await expectLater(pay.start(environment: 'sandbox'), throwsStateError);
+    expect(store.releases, 1);
+
+    store.reject = false;
+    final owner = Object();
+    pay.attachLegacy(owner, (_) async {}, (_, __) {}, (_) {});
+    await Future.wait([
+      pay.buyLegacy(owner, 'sku', 'legacy-order'),
+      pay.buyLegacy(owner, 'sku', 'legacy-order'),
+    ]);
+
+    final header = await journal.read((db) => db.query('meta'));
+    expect(header.single['environment'], 'sandbox');
+    expect(header.single['appId'], 'app');
+    expect(store.registrations, 2);
+    expect(store.snapshots, 1);
+    expect(store.submitted, ['legacy-order']);
+  });
+
+  test('explicit startup can replace an environment that never started',
+      () async {
+    store.reject = true;
+    await expectLater(pay.start(environment: 'sandbox'), throwsStateError);
+    store.reject = false;
+    await pay.start(environment: 'production');
+
+    final header = await journal.read((db) => db.query('meta'));
+    expect(header.single['environment'], 'production');
+    expect(store.registrations, 2);
+    expect(store.snapshots, 1);
+  });
+
   test(
       'startup validates identity, buffers pending registration and releases failed owner',
       () async {

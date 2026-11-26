@@ -145,7 +145,8 @@ class ApplePayments {
   final _observedHere = <String>{};
   List<StoreEvent>? _buffer;
   final _queuedWork = <String>{};
-  bool _ready = false, _managedRequested = false;
+  bool _ready = false;
+  String? _requestedEnvironment;
 
   /// Use the running application's bundle identifier in the selected store environment.
   Future<void> start({required String environment}) {
@@ -156,7 +157,7 @@ class ApplePayments {
     if (_environment != null && _environment != environment) {
       throw StateError('Apple service identity already configured');
     }
-    _managedRequested = true;
+    _requestedEnvironment = environment;
     _environment = environment;
     return _configuration ??=
         _configure(environment).catchError((Object error) {
@@ -210,9 +211,11 @@ class ApplePayments {
     }
     if (_ready) return Future.value();
     if (_configuration != null) return _configuration!;
-    if (_managedRequested || _legacy.isEmpty) {
+    if (_legacy.isEmpty) {
       throw StateError('Apple payments not started');
     }
+    final environment = _requestedEnvironment;
+    if (environment != null) return start(environment: environment);
     return _boot ??= _open(null, null).catchError((Object error) {
       _boot = null;
       throw error;
