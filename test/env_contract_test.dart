@@ -348,6 +348,17 @@ void main() {
     });
   }
 
+  test('an invalid environment leaves legacy startup available', () async {
+    expect(() => pay.start(environment: 'Sandbox'), throwsArgumentError);
+    expect(store.registrations, 0);
+
+    final owner = Object();
+    pay.attachLegacy(owner, (_) async {}, (_, __) {}, (_) {});
+    await pay.buyLegacy(owner, 'sku', 'legacy-order');
+    expect(store.registrations, 1);
+    expect(store.submitted, ['legacy-order']);
+  });
+
   test(
       'startup validates identity, buffers pending registration and releases failed owner',
       () async {

@@ -150,13 +150,13 @@ class ApplePayments {
   /// Use the running application's bundle identifier in the selected store environment.
   Future<void> start({required String environment}) {
     if (_closed) throw StateError('Apple payments closed');
-    _managedRequested = true;
     if (!appleEnvironments.contains(environment)) {
       throw ArgumentError('Expected production, sandbox or xcode');
     }
     if (_environment != null && _environment != environment) {
       throw StateError('Apple service identity already configured');
     }
+    _managedRequested = true;
     _environment = environment;
     return _configuration ??=
         _configure(environment).catchError((Object error) {
