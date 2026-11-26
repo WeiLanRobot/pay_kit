@@ -313,6 +313,18 @@ Future<void> _indexSubmissions(Database db, String base, String? app) async {
             .single
             .values
             .single as int;
+        final seen = await tx.rawQuery(
+            'SELECT version,revision FROM recovery.indexed_partition WHERE name=?',
+            [suffix]);
+        // First open can leave an empty file before the schema transaction commits.
+        if (version == 0 && suffix.isNotEmpty && seen.isEmpty) {
+          final objects =
+              await tx.rawQuery('SELECT 1 FROM $source.sqlite_master LIMIT 1');
+          if (objects.isEmpty) {
+            final check = await tx.rawQuery('PRAGMA $source.quick_check(1)');
+            if (check.single.values.single == 'ok') return;
+          }
+        }
         if (version < 1 || version > 5) {
           throw StateError('Unsupported Apple submission ledger version');
         }
@@ -333,9 +345,6 @@ Future<void> _indexSubmissions(Database db, String base, String? app) async {
         if (origin != null) {
           await _locateCompatibilityCopies(tx, source, origin);
         }
-        final seen = await tx.rawQuery(
-            'SELECT version,revision FROM recovery.indexed_partition WHERE name=?',
-            [suffix]);
         if (seen.isNotEmpty &&
             seen.single['version'] == version &&
             (version >= 4 && suffix != '.compat' ||

@@ -162,6 +162,74 @@ void main() {
     expect((await journal.read((db) => db.query('purchase'))).length, 2);
   });
 
+  test('an interrupted compatibility partition can be selected after restart',
+      () async {
+    await journal.select('app', 'production');
+    await journal.write((db) => purchase(db, 'paid'));
+    await journal.close();
+    await File('${file.path}.compat').create();
+
+    for (var restart = 0; restart < 2; restart++) {
+      await journal.select('app', 'production');
+      expect((await journal.read((db) => db.query('purchase'))).single['id'],
+          'paid');
+      await journal.close();
+    }
+    await journal.select(null, null);
+    expect(await journal.read((db) => db.query('purchase')), isEmpty);
+    await journal.write((db) => purchase(db, 'legacy'));
+    await journal.close();
+    await journal.select(null, null);
+    expect((await journal.read((db) => db.query('purchase'))).single['id'],
+        'legacy');
+  });
+
+  test('an empty partition cannot hide an unversioned empty table', () async {
+    await journal.select('app', 'production');
+    await journal.close();
+    await File('${file.path}.compat').create();
+    final path = '${file.path}.sandbox';
+    final other = await openDatabase(path);
+    await other.execute('CREATE TABLE prior(id TEXT)');
+    await other.close();
+
+    await expectLater(journal.select('app', 'production'), throwsStateError);
+    final check = await openDatabase(path);
+    try {
+      expect(await check.getVersion(), 0);
+      expect(await check.query('prior'), isEmpty);
+    } finally {
+      await check.close();
+    }
+  });
+
+  test('a previously indexed partition cannot restart as an empty file',
+      () async {
+    await journal.select(null, null);
+    await journal.write((db) => purchase(db, 'legacy'));
+    await journal.select('app', 'production');
+    await journal.close();
+    await File('${file.path}.compat').writeAsBytes([]);
+
+    await expectLater(journal.select('app', 'production'), throwsStateError);
+  });
+
+  test('an empty schema cannot hide a damaged partition', () async {
+    await journal.select('app', 'production');
+    await journal.close();
+    final compat = File('${file.path}.compat');
+    final db = await openDatabase(compat.path);
+    await db.execute('VACUUM');
+    await db.close();
+    final bytes = await compat.readAsBytes();
+    // The SQLite header counts freelist pages at bytes 36–39. This file has none.
+    bytes[39] = 1;
+    await compat.writeAsBytes(bytes);
+
+    await expectLater(journal.select('app', 'production'), throwsStateError);
+    expect(await compat.readAsBytes(), bytes);
+  });
+
   test('corruption and newer versions fail closed without replacing data',
       () async {
     await file.parent.create(recursive: true);
