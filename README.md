@@ -132,9 +132,13 @@ final snapshot = await account.buy(
 
 对于无争议且已有服务端最终回执的扣款，页面按 `charge.disposition` 展示已发货（`delivered`）或已退款（`refunded`）。即使 `charge.finishPending` 为 `true`，也可以立即展示该结果。这个标志表示 SDK 还没有记录这笔扣款所有队列项的移除确认。如果 App 在 StoreKit 移除交易后、确认写入本地前退出，重启时的空队列无法补回这条确认，该标志可能一直为 `true`，相关收据也可能继续保留。
 
-**验单与发货。** 应用服务端核实应用、环境、SKU、数量、订单归属和每笔 Apple 交易，以经 Apple 核实的交易号幂等发货或退款。验单回调通过受信客户端获取结果，分别返回 `AppleVerification.delivered(AppleDisposition(...))`、`retryLater()`、`invalidEvidence()` 或 `needsReconciliation()`。最终回执同时绑定设备报告的交易号和服务端确认的交易号。多笔扣款分别处置。库先保存回执，再结束对应的原生队列项。网络恢复可调用 `await payments.retryPending()` 安排重试，取消或关闭支付页不会丢弃待验凭证。用户主动调用 `refreshReceipts()` 时系统可能要求 Apple ID 认证。
+**验单与发货。** 应用服务端核实应用、环境、SKU、数量、订单归属和每笔 Apple 交易，以经 Apple 核实的交易号幂等发货或退款。验单回调通过受信客户端获取结果，分别返回 `AppleVerification.delivered(AppleDisposition(...))`、`retryLater()`、`invalidEvidence()` 或 `needsReconciliation()`。最终回执同时绑定设备报告的交易号和服务端确认的交易号。多笔扣款分别处置。库先保存回执，再结束对应的原生队列项。网络恢复可调用 `await payments.retryPending()` 唤醒可执行的待办。正在验单的扣款继续等待，处于退避的扣款在到期后重试。某份收据超时后，SDK 记住轮换位置，重启后其他合格收据仍有机会验单。取消或关闭支付页不会丢弃待验凭证。用户主动调用 `refreshReceipts()` 时系统可能要求 Apple ID 认证。
 
 **对账。** 只有受信的应用级恢复服务应读取 `await payments.unmatched()` 中的完整凭证，用 `payments.reconcile(AppleClaim(...))` 提交服务端确认的归属。无法查证的原商店 UUID 保持空值。尚无交易号的尝试可由受信恢复服务通过 `unresolvedAttempts()` 找到，再用 `resolveAttempt(AppleAttemptDecision(...))` 记录持久裁决。只有能证明本次未提交或最终未扣款的权威结论才允许重新购买。SDK 依赖宿主认证这些裁决和回执。服务端已发货但应答丢失时要返回原回执。
+
+同一笔已付款交易可能在两次启动中产生不同的观察 ID。受信恢复服务可以把要核对的 ID 放入 `AppleClaim.observationId`，然后调用 `await payments.recoverObservation(claim)`。返回值分别给出经核实的扣款处置和这一次观察的状态。例如，服务端已发货但无法证明当前队列项的来源时，`disposition` 可以是已发货，`state` 仍是 `AppleObservationState.sourceUnproven`。此时可以向用户展示已发权益，保留该观察继续核对。重启后出现新的观察 ID，应使用新 ID 办理该项。旧 `reconcile` 遇到多个来源未明的同号观察时，会抛出 `AppleAmbiguousObservation`，受信服务可改用上述入口核对具体观察。
+
+若要在重装后为某项补收尾，可以通过 `originalSubmission` 传入宿主已认证的 `AppleOriginalSubmission`。服务端须在购买前为这一次提交独占登记 UUID，并核实购买时 Apple 交易与原始 UUID、环境、商品及数量的对应关系。仅有事后设置的 token 或覆盖多笔交易的 App 收据时，可以提交已核实的最终处置，等待对象来源得到证明。
 
 若交易有相互冲突的认领或处置，`unmatched()` 会给出争议引用、当前修订号和回执引用。应用级服务将已认证的 `AppleDisputeReview` 传给 `AppleClaim` 的 `review` 参数。复核须指向当前争议；涉及已发货订单的补偿时，还须核对原履约回执。托管验单超时或切换账号后可能重试同一笔付款，服务端必须按应用、真实商店环境和核实的交易号原子去重。`AppleAttemptDecision` 须绑定环境；旧业务订单串缺失时，已付款裁决还须有能独立关联原提交的依据。
 

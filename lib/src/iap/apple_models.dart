@@ -241,3 +241,60 @@ typedef AppleRecoveryAttempt = ({
   String phase,
   String? reason
 });
+
+/// Authenticated evidence of an exclusive pre-purchase token registration and
+/// the Apple transaction that originally carried it. The issuer must verify
+/// the original transaction, including the mapping of device and receipt IDs.
+class AppleOriginalSubmission {
+  const AppleOriginalSubmission({
+    required this.issuer,
+    required this.reference,
+    required this.appId,
+    required this.environment,
+    required this.scope,
+    required this.orderId,
+    required this.productId,
+    required this.quantity,
+    required this.purchaseToken,
+    required this.reportedTransactionId,
+    required this.verifiedTransactionId,
+  });
+  final String issuer, reference, appId, environment, scope, orderId, productId;
+  final int quantity;
+  final String purchaseToken, reportedTransactionId, verifiedTransactionId;
+}
+
+enum AppleObservationState {
+  sourceUnproven,
+  awaitingReplay,
+  awaitingDisposition,
+  awaitingRemoval,
+  removed,
+  disputed
+}
+
+/// State of one observation. A charge may be delivered while the source of
+/// this particular item remains unknown. Recovery never submits a new purchase.
+class AppleRecoveryResult {
+  const AppleRecoveryResult(
+      {required this.observationId,
+      required this.state,
+      this.scope,
+      this.orderId,
+      this.verifiedTransactionId,
+      this.disposition,
+      this.reference,
+      this.reason});
+  final String observationId;
+  final AppleObservationState state;
+  final String? scope,
+      orderId,
+      verifiedTransactionId,
+      disposition,
+      reference,
+      reason;
+}
+
+class AppleAmbiguousObservation extends StateError {
+  AppleAmbiguousObservation() : super('Apple observation source is ambiguous');
+}

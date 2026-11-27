@@ -8,6 +8,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
 
+const _ledgerVersion = 6;
+
 /// The private SK1 ledger. Operations must contain only database work.
 /// SQLite holds the file's exclusive lock until [close], including between
 /// transactions. Another connection (even from another engine) cannot write.
@@ -41,6 +43,14 @@ class AppleJournal {
 
         try {
           final main = await use(base.path);
+          // A v6 ledger restored with an older sidecar has lost authority facts.
+          // Detect the mismatch before registering the StoreKit observer.
+          final facts = await main.rawQuery(
+              "SELECT name FROM recovery.sqlite_master WHERE type='table' "
+              "AND name IN ('original_submission','observation_review')");
+          if (facts.length != 2) {
+            throw StateError('Incomplete Apple recovery ledger');
+          }
           final header = (await main.query('meta')).single;
           if (app != null &&
               header['appId'] != null &&
@@ -105,6 +115,8 @@ class AppleJournal {
       await db.execute(
           'INSERT INTO purchase SELECT * FROM compatibility.purchase WHERE attemptId=?',
           [id]);
+      await db.update('purchase', {'lastTimeoutSeq': null},
+          where: 'attemptId=? AND lastTimeoutSeq IS NOT NULL', whereArgs: [id]);
       await db.execute(
           'INSERT OR IGNORE INTO evidence SELECT e.* FROM compatibility.evidence e JOIN compatibility.purchase_evidence x ON e.hash=x.hash JOIN purchase p ON p.id=x.purchaseId WHERE p.attemptId=?',
           [id]);
@@ -145,7 +157,7 @@ class AppleJournal {
     await file.parent.create(recursive: true);
     final db = await openDatabase(
       file.path,
-      version: 5,
+      version: _ledgerVersion,
       singleInstance: false,
       onConfigure: (db) async {
         await db.rawQuery('PRAGMA busy_timeout = 0');
@@ -166,9 +178,10 @@ class AppleJournal {
           await db.execute(statement);
         }
         await _installV3(db);
+        await _installV6(db);
       },
       onUpgrade: (db, from, to) async {
-        if (from < 1 || from > 4) {
+        if (from < 1 || from >= _ledgerVersion) {
           throw StateError('Unsupported Apple ledger upgrade');
         }
         if (from == 1) {
@@ -191,19 +204,20 @@ class AppleJournal {
         // The header and foreign keys must be consistent before committing an
         // upgrade, including when this is the application's first launch.
         await _checkHeader(db);
-        if (from >= 3) {
-          await restoreUnprovenAttempts(db);
+        if (from <= 4) {
+          if (from < 3) {
+            final columns = await db.rawQuery('PRAGMA table_info(purchase)');
+            if (!columns.any((c) => c['name'] == 'inputVersion')) {
+              await _installV3(db);
+            }
+            await _quarantineCandidate(db);
+          } else {
+            await restoreUnprovenAttempts(db);
+          }
           await installReviewedIdentityGuard(db);
           await restoreAppleIdentityDisputes(db);
-          return;
         }
-        final columns = await db.rawQuery('PRAGMA table_info(purchase)');
-        if (!columns.any((c) => c['name'] == 'inputVersion')) {
-          await _installV3(db);
-        }
-        await _quarantineCandidate(db);
-        await installReviewedIdentityGuard(db);
-        await restoreAppleIdentityDisputes(db);
+        await _installV6(db);
       },
       onDowngrade: (db, from, to) async {
         throw StateError('Unsupported newer Apple ledger version $from');
@@ -280,8 +294,10 @@ Future<void> reserveAppleToken(
     DatabaseExecutor db, String wire, String origin, String id) async {
   final token = appleWireKey(wire);
   await db.rawInsert(
-      'INSERT OR IGNORE INTO recovery.submission(token,origin,attemptId) VALUES (?,?,?)',
-      [token, origin, id]);
+      '''INSERT OR IGNORE INTO recovery.submission(token,origin,attemptId)
+         SELECT ?,?,? WHERE NOT EXISTS (
+           SELECT 1 FROM recovery.original_submission WHERE token=?)''',
+      [token, origin, id, token]);
   final entries = await db.rawQuery(
       'SELECT origin,attemptId FROM recovery.submission WHERE token=? LIMIT 2',
       [token]);
@@ -325,7 +341,7 @@ Future<void> _indexSubmissions(Database db, String base, String? app) async {
             if (check.single.values.single == 'ok') return;
           }
         }
-        if (version < 1 || version > 5) {
+        if (version < 1 || version > _ledgerVersion) {
           throw StateError('Unsupported Apple submission ledger version');
         }
         final header = (await tx.rawQuery('SELECT * FROM $source.meta')).single;
@@ -485,6 +501,37 @@ Future<void> _installV3(DatabaseExecutor db) async {
   }
   await db.execute('ALTER TABLE queue_item ADD COLUMN observation TEXT');
   await installAppleArbitrationSchema(db);
+}
+
+const _recoveryV6 = [
+  '''CREATE INDEX IF NOT EXISTS recovery.disputed_submission_charge
+       ON observation(boundEnvironment,boundPurchase)
+       WHERE reason='originalSubmissionConflict' ''',
+  '''CREATE TABLE IF NOT EXISTS recovery.original_submission(
+       appId TEXT NOT NULL, token TEXT NOT NULL, issuer TEXT NOT NULL,
+       reference TEXT NOT NULL, environment TEXT NOT NULL, scope TEXT NOT NULL,
+       orderId TEXT NOT NULL, productId TEXT NOT NULL, verifiedId TEXT NOT NULL,
+       reportedId TEXT NOT NULL, PRIMARY KEY(token,appId,issuer,reference,
+         environment,scope,orderId,productId,verifiedId,reportedId))''',
+  '''CREATE INDEX IF NOT EXISTS recovery.original_submission_reference
+       ON original_submission(appId,issuer,reference)''',
+  '''CREATE TABLE IF NOT EXISTS recovery.observation_review(
+       observation TEXT PRIMARY KEY)''',
+];
+
+Future<void> _installV6(DatabaseExecutor db) async {
+  for (final sql in _recoveryV6) {
+    await db.execute(sql);
+  }
+  final columns = await db.rawQuery('PRAGMA table_info(purchase)');
+  if (!columns.any((c) => c['name'] == 'lastTimeoutSeq')) {
+    await db.execute('ALTER TABLE purchase ADD COLUMN lastTimeoutSeq INTEGER');
+  }
+  // A cursor belongs to the exact set of verifier inputs in this partition.
+  await db.execute('''CREATE TRIGGER IF NOT EXISTS reset_timeout_cursor
+    AFTER UPDATE OF inputVersion ON purchase
+    WHEN NEW.inputVersion != OLD.inputVersion AND NEW.lastTimeoutSeq IS NOT NULL
+    BEGIN UPDATE purchase SET lastTimeoutSeq=NULL WHERE id=NEW.id; END''');
 }
 
 Future<void> _quarantineCandidate(DatabaseExecutor db) async {

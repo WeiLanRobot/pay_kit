@@ -1,0 +1,299 @@
+part of 'apple_payments.dart';
+
+extension _AppleRecovery on ApplePayments {
+  Future<_Row?> _verifiedCharge(DatabaseExecutor db, AppleClaim c) async =>
+      (await db.query('purchase',
+              where: 'appId=? AND environment=? AND verifiedId=?',
+              whereArgs: [c.appId, c.environment, c.verifiedTransactionId]))
+          .firstOrNull;
+
+  /// Accepts a host-authenticated statement about the original submission.
+  /// Retain competing statements so a retry cannot silently erase a collision.
+  Future<void> _saveOriginal(
+      DatabaseExecutor db, AppleClaim c, AppleOriginalSubmission s) async {
+    if (s.issuer.trim().isEmpty ||
+        s.reference.trim().isEmpty ||
+        s.appId != c.appId ||
+        s.environment != c.environment ||
+        s.scope != c.scope ||
+        s.orderId != c.orderId ||
+        s.productId != c.productId ||
+        s.quantity != 1 ||
+        s.reportedTransactionId != c.reportedTransactionId ||
+        s.verifiedTransactionId != c.verifiedTransactionId ||
+        !Uuid.isValidUUID(fromString: s.purchaseToken) ||
+        _wire(s.purchaseToken) != _wire(c.purchaseToken)) {
+      throw StateError(
+          'Original Apple submission does not match the authenticated claim');
+    }
+    await db.insert(
+        'recovery.original_submission',
+        {
+          'appId': s.appId,
+          'token': _wire(s.purchaseToken),
+          'issuer': s.issuer,
+          'reference': s.reference,
+          'environment': s.environment,
+          'scope': s.scope,
+          'orderId': s.orderId,
+          'productId': s.productId,
+          'verifiedId': s.verifiedTransactionId,
+          'reportedId': s.reportedTransactionId,
+        },
+        conflictAlgorithm: ConflictAlgorithm.ignore);
+    // The evidence registry is shared by every environment of this app.
+    // If a signer reuses a reference, quarantine both affected submissions.
+    final collision = await db.rawQuery(
+        """SELECT DISTINCT a.token FROM recovery.original_submission a
+      JOIN recovery.original_submission b ON a.appId=b.appId AND
+        (a.token=b.token OR (a.issuer=b.issuer AND a.reference=b.reference))
+      WHERE a.appId=? AND (a.token=? OR (a.issuer=? AND a.reference=?)) AND
+        (a.token!=b.token OR a.environment!=b.environment OR a.scope!=b.scope OR
+         a.orderId!=b.orderId OR a.productId!=b.productId OR a.reportedId!=b.reportedId OR
+         a.verifiedId!=b.verifiedId)""",
+        [c.appId, _wire(s.purchaseToken), s.issuer, s.reference]);
+    for (final entry in collision) {
+      await db.rawUpdate(
+          """UPDATE recovery.observation SET reason='originalSubmissionConflict'
+        WHERE token=? AND (reason='originalSubmission' OR id=?)""",
+          [entry['token'], c.observationId]);
+    }
+  }
+
+  Future<bool> _sourceForObservation(
+      DatabaseExecutor db, AppleClaim c, _Row r) async {
+    if (r['reason'] == 'originalSubmissionConflict' ||
+        r['generation'] == 'verified' && r['originLinked'] != 1) {
+      return false;
+    }
+    final bound = r['boundPurchase'];
+    if (bound is String && r['boundEnvironment'] == c.environment) {
+      final p =
+          await _row(db, 'purchase', await _canonicalPurchaseId(db, bound));
+      return p != null &&
+          p['verifiedId'] == c.verifiedTransactionId &&
+          p['appId'] == c.appId;
+    }
+    final token = _wire(c.purchaseToken);
+    if (token == null || token != r['token']) return false;
+    final claims = await db.rawQuery('''SELECT s.*, EXISTS(
+      SELECT 1 FROM recovery.original_submission b WHERE b.appId=s.appId AND b.issuer=s.issuer
+      AND b.reference=s.reference AND b.token!=s.token) AS reusedReference
+      FROM recovery.original_submission s WHERE s.appId=? AND s.token=?''',
+        [c.appId, token]);
+    final original = claims.isNotEmpty &&
+        claims.every((p) =>
+            p['reusedReference'] == 0 &&
+            p['environment'] == c.environment &&
+            p['scope'] == c.scope &&
+            p['orderId'] == c.orderId &&
+            p['productId'] == c.productId &&
+            p['verifiedId'] == c.verifiedTransactionId &&
+            p['reportedId'] == c.reportedTransactionId);
+    if (claims.isNotEmpty && !original) return false;
+    final reservations = await db
+        .query('recovery.submission', where: 'token=?', whereArgs: [token]);
+    if (reservations.isEmpty) return original;
+    if (reservations.length != 1) return false;
+    final a = await _attemptForToken(db, token);
+    final reservation = reservations.single;
+    if (a != null &&
+        a['phase'] != 'prepared' &&
+        !_unpaidPhase(a['phase']) &&
+        reservation['attemptId'] == a['id'] &&
+        a['productId'] == c.productId &&
+        a['orderId'] == c.orderId &&
+        !_disagrees(a['scope'], c.scope) &&
+        (reservation['origin'] == c.environment ||
+            reservation['origin'] == 'legacy' && a['mode'] == 'legacy')) {
+      return true;
+    }
+    // Only a previously linked compatibility handoff or trusted environment
+    // correction can move an original submission into another partition.
+    return (await db.rawQuery(
+            '''SELECT 1 FROM recovery.observation WHERE
+      actual=? AND verifiedId=? AND productId=? AND token=? AND originLinked=1 AND
+      (reason IN ('environmentMismatch','environmentSelected') OR
+       (generation='compatibility' AND reason='legacySubmissionObserved' AND reportedId=?)) LIMIT 1''',
+            [
+          c.environment,
+          c.verifiedTransactionId,
+          c.productId,
+          token,
+          c.reportedTransactionId
+        ]))
+        .isNotEmpty;
+  }
+
+  Future<AppleRecoveryResult> _recoverObservation(
+      AppleClaim c, AppleOriginalSubmission? original) async {
+    final id = c.observationId;
+    if (!_validClaim(c) ||
+        id == null ||
+        id.trim().isEmpty ||
+        c.disposition != null && !_matchesClaim(c, c.disposition!)) {
+      throw StateError('Invalid Apple observation claim');
+    }
+    final affected = <String>{};
+    final state = await _journal.write((db) async {
+      var r = await _row(db, 'recovery.observation', id);
+      if (r == null) throw StateError('Unknown Apple observation');
+      if (r['status'] != 'paid' ||
+          r['productId'] != c.productId ||
+          r['reportedId'] != c.reportedTransactionId ||
+          _disagrees(r['actual'], c.environment) ||
+          _disagrees(r['boundEnvironment'], c.environment) ||
+          _disagrees(r['verifiedId'], c.verifiedTransactionId) ||
+          _disagrees(r['token'], _wire(c.purchaseToken)) ||
+          const {
+            'identityConflict',
+            'environmentRejected',
+            'environmentConflict',
+            'compatibilityTransferred'
+          }.contains(r['reason'])) {
+        throw StateError(
+            'Apple recovery observation does not match the authenticated claim');
+      }
+      if (r['boundPurchase'] case final String bound) {
+        final assigned =
+            await _row(db, 'purchase', await _canonicalPurchaseId(db, bound));
+        if (assigned == null ||
+            _disagrees(assigned['verifiedId'], c.verifiedTransactionId)) {
+          throw StateError(
+              'Apple observation already bound to a different charge');
+        }
+      }
+      if (original != null) {
+        await _saveOriginal(db, c, original);
+        r = (await _row(db, 'recovery.observation', id))!;
+      }
+      await db.insert('recovery.observation_review', {'observation': id},
+          conflictAlgorithm: ConflictAlgorithm.ignore);
+      var purchase = await _verifiedCharge(db, c);
+      final ruling = c.review;
+      if (ruling != null) {
+        final reviewed = await _row(db, 'purchase', ruling.disputeId);
+        if (reviewed == null ||
+            _disagrees(purchase?['id'], reviewed['id']) ||
+            _disagrees(reviewed['appId'], c.appId) ||
+            _disagrees(reviewed['environment'], c.environment)) {
+          throw StateError('Unknown Apple review target');
+        }
+        purchase = reviewed;
+      }
+      final proven = await _sourceForObservation(db, c, r);
+      if (proven) {
+        final byReport = await _reportedPurchase(db, c.reportedTransactionId);
+        if (byReport != null &&
+            _disagrees(byReport['verifiedId'], c.verifiedTransactionId)) {
+          throw StateError(
+              'Reported Apple identity already bound to a different verified charge');
+        }
+        await _applyClaim(db, c, exactObservation: r, affected: affected);
+      } else if (c.disposition != null ||
+          purchase?['disposition'] != null ||
+          c.review != null && purchase != null) {
+        await _recordFinancialClaim(db, c, purchase, affected);
+      }
+      purchase = await _verifiedCharge(db, c);
+      final current = (await _row(db, 'recovery.observation', id))!;
+      final linked = purchase != null &&
+          current['boundEnvironment'] == c.environment &&
+          current['boundPurchase'] != null &&
+          await _canonicalPurchaseId(db, current['boundPurchase'] as String) ==
+              purchase['id'];
+      final AppleObservationState status;
+      if (purchase?['conflict'] == 1 ||
+          current['reason'] == 'originalSubmissionConflict') {
+        status = AppleObservationState.disputed;
+      } else if (!linked) {
+        status = AppleObservationState.sourceUnproven;
+      } else if (current['finished'] == 1) {
+        status = AppleObservationState.removed;
+      } else if (current['generation'] != _generation ||
+          !_currentUnbound.containsKey(id)) {
+        status = AppleObservationState.awaitingReplay;
+      } else if (purchase['disposition'] == null) {
+        status = AppleObservationState.awaitingDisposition;
+      } else {
+        status = AppleObservationState.awaitingRemoval;
+      }
+      if (proven && purchase != null) affected.add(purchase['id'] as String);
+      return AppleRecoveryResult(
+          observationId: id,
+          state: status,
+          scope: purchase?['scope'] as String?,
+          orderId: purchase?['orderId'] as String?,
+          verifiedTransactionId: purchase?['verifiedId'] as String?,
+          disposition: purchase?['disposition'] as String?,
+          reference: purchase?['ackRef'] as String?,
+          reason: status == AppleObservationState.sourceUnproven &&
+                  purchase?['disposition'] == null
+              ? 'dispositionOrSourceRequired'
+              : current['reason'] == 'originalSubmissionConflict'
+                  ? 'originalSubmissionConflict'
+                  : purchase?['reason'] as String? ?? status.name);
+    });
+    _changed();
+    for (final id in affected) {
+      _schedule(id);
+    }
+    return state;
+  }
+
+  // The Apple identity selects the financial record. No device alias, attempt
+  // or queue item can be discovered or created by this branch.
+  Future<void> _recordFinancialClaim(DatabaseExecutor db, AppleClaim c,
+      _Row? existing, Set<String> affected) async {
+    var p = existing;
+    if (c.review != null) {
+      if (p == null || c.disposition != null) {
+        throw StateError('Invalid Apple review');
+      }
+      await _reviewDispute(db, p, p, c, affected, authorizeItems: false);
+      return;
+    }
+    if (p == null) {
+      final id = const Uuid().v4();
+      await db.insert('purchase', {
+        'id': id,
+        'scope': c.scope,
+        'orderId': c.orderId,
+        'productId': c.productId,
+        'appId': c.appId,
+        'environment': c.environment,
+        'verifiedId': c.verifiedTransactionId,
+        'claimRef': c.reference
+      });
+      p = (await _row(db, 'purchase', id))!;
+    }
+    final prior = (await db.query('claim_fact',
+            where: 'purchaseId=? AND payload=?',
+            whereArgs: [p['id'], _claimPayload(c)]))
+        .firstOrNull;
+    final ack = c.disposition;
+    if (prior?['covered'] != 1) {
+      await _saveClaim(db, p, c);
+      final otherSku = await db.rawQuery(
+          '''SELECT 1 FROM purchase WHERE scope=? AND orderId=? AND productId!=?
+        UNION ALL SELECT 1 FROM attempt WHERE scope=? AND orderId=? AND productId!=? LIMIT 1''',
+          [c.scope, c.orderId, c.productId, c.scope, c.orderId, c.productId]);
+      if (p['productId'] != c.productId ||
+          p['scope'] != c.scope ||
+          p['orderId'] != c.orderId ||
+          otherSku.isNotEmpty) {
+        await _openDispute(db, p, 'ownershipConflict', _claimPayload(c));
+        if (ack != null && await _saveDisposition(db, p, ack)) {
+          await _openDispute(db, p, 'dispositionConflict', _ackPayload(ack));
+        }
+        return;
+      }
+      if (p['claimRef'] == null) {
+        await db.update('purchase', {'claimRef': c.reference},
+            where: 'id=?', whereArgs: [p['id']]);
+      }
+      await _reservePrimary(db, c.scope, c.orderId, p['id'] as String);
+    }
+    if (ack != null) await _recordDisposition(db, p, ack);
+  }
+}

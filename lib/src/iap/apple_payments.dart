@@ -13,6 +13,7 @@ import 'apple_store.dart';
 export 'apple_models.dart';
 part 'apple_delivery.dart';
 part 'apple_environment.dart';
+part 'apple_recovery.dart';
 
 typedef _Legacy = ({
   Future<void> Function(String)? receive,
@@ -117,8 +118,21 @@ class ApplePayments {
   final _handleAliases = <String, String>{};
   final _observationIds = Expando<String>();
   final _closingItems = <String, Future<void>>{};
+  // StoreKit already confirmed these objects. Retry only their journal commit.
+  final _removedItems = <String, _Removal>{};
+
+  @visibleForTesting
+  ({int queue, int recovery}) get cachedReceiptCounts => (
+        queue: _live.values.where((event) => event.receipt.isNotEmpty).length,
+        recovery: _currentUnbound.values
+            .where((event) => event.receipt.isNotEmpty)
+            .length
+      );
   final _calls = <String, _VerificationCall>{};
   final _cooldowns = <String, (String, int)>{};
+  // Usually lives only until the timeout write commits. Keep its small identity
+  // across storage failures so a retry registers progress before dispatching.
+  final _unwrittenTimeouts = <String, ({String login, int version, int seq})>{};
   final _responding = <Future<_CandidateResult>>{};
   Future<void>? _checkingCalls;
   bool _checkAgain = false;
@@ -193,6 +207,7 @@ class ApplePayments {
       if (_launches.isNotEmpty ||
           _workers.isNotEmpty ||
           _closingItems.isNotEmpty ||
+          _removedItems.isNotEmpty ||
           _launchResults.isNotEmpty) {
         throw StateError(
             'Legacy payment work in progress; retry managed startup');
@@ -333,8 +348,8 @@ class ApplePayments {
         _checkAgain = false;
         for (final entry in _calls.entries.toList()) {
           final call = entry.value;
-          final row =
-              await _journal.read((db) => _row(db, 'purchase', entry.key));
+          final row = await _journal
+              .read((db) => _verifierInput(db, entry.key, call.hash));
           if (identical(_calls[entry.key], call) &&
               (row == null ||
                   row['inputVersion'] != call.version ||
@@ -767,6 +782,10 @@ class ApplePayments {
     for (final entry in _launchResults.entries.toList()) {
       await _saveLaunchResult(entry.key, entry.value);
     }
+    for (final removal in _removedItems.values.toSet()) {
+      await _finishOne(removal.key, removal.event, removal.purchase,
+          unbound: removal.unbound);
+    }
     for (final event in _unwritten.toList()) {
       _queueEvent(event);
     }
@@ -775,8 +794,10 @@ class ApplePayments {
         SELECT 1 FROM queue_item q WHERE q.purchaseId=p.id AND q.finished=0)
     '''));
     // An explicit retry inside the current verifier must not perpetually requeue itself.
-    for (final row in rows) {
-      final id = row['id'] as String;
+    for (final id in {
+      ..._unwrittenTimeouts.keys,
+      ...rows.map((row) => row['id'] as String),
+    }) {
       if (!_workers.containsKey(id)) _schedule(id);
     }
     for (final entry in _currentUnbound.entries.toList()) {
@@ -819,6 +840,17 @@ class ApplePayments {
     await _events;
     if (_closed || !identical(_configuration, context)) return;
     await _refreshEvidence(context, targets.purchases, targets.unbound, body);
+  }
+
+  /// Authenticated application-level recovery of exactly one saved observation.
+  Future<AppleRecoveryResult> recoverObservation(AppleClaim claim,
+      {AppleOriginalSubmission? originalSubmission}) async {
+    if (_configuration == null) {
+      throw StateError('Application identity required');
+    }
+    await _configuration;
+    if (!_ready || _closed) throw StateError('Application identity required');
+    return _recoverObservation(claim, originalSubmission);
   }
 
   Future<void> reconcile(AppleClaim claim) async {

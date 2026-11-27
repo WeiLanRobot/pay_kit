@@ -96,6 +96,31 @@ Future<void> _reservePrimary(
         {'scope': scope ?? '', 'orderId': order, 'purchaseId': id},
         conflictAlgorithm: ConflictAlgorithm.ignore);
 
+// The financial charge can remain valid after the only proof linking a device
+// observation to it is disputed. Share an app receipt with the account again
+// only if an independently bound observation supports these exact bytes.
+// x is the purchase_evidence row in the current ledger partition.
+const _boundToEvidenceCharge =
+    '''o.boundEnvironment=(SELECT environment FROM meta)
+  AND (o.boundPurchase=x.purchaseId OR o.boundPurchase IN
+    (SELECT id FROM purchase_redirect WHERE purchaseId=x.purchaseId))''';
+const _canDeliverEvidence = '''(
+  NOT EXISTS(SELECT 1 FROM recovery.observation o
+    WHERE o.reason='originalSubmissionConflict' AND $_boundToEvidenceCharge)
+  OR EXISTS(SELECT 1 FROM recovery.candidate c
+    JOIN recovery.observation o ON o.id=c.observation
+    WHERE c.hash=x.hash AND $_boundToEvidenceCharge AND o.status='paid'
+      AND (o.generation NOT IN ('verified','candidate','compatibility') OR o.originLinked=1)
+      AND (o.reason IS NULL OR o.reason NOT IN ('originalSubmissionConflict','identityConflict',
+          'environmentConflict','environmentRejected','compatibilityTransferred')))
+)''';
+
+Future<_Row?> _verifierInput(
+        DatabaseExecutor db, String id, String hash) async =>
+    (await db.rawQuery('''SELECT p.* FROM purchase p JOIN purchase_evidence x
+      ON x.purchaseId=p.id WHERE p.id=? AND x.hash=? AND x.rejected=0
+      AND $_canDeliverEvidence''', [id, hash])).firstOrNull;
+
 Future<void> _addEvidence(DatabaseExecutor db, String id, String receipt,
     {String source = 'store', String? context}) async {
   if (receipt.isEmpty) return;
@@ -364,6 +389,13 @@ String? _handleKey(StoreEvent event) {
   return handle is String && handle.isNotEmpty ? 'handle:$handle' : null;
 }
 
+typedef _Removal = ({
+  String key,
+  StoreEvent event,
+  String? purchase,
+  String? unbound,
+});
+
 extension _AppleDelivery on ApplePayments {
   Future<String> _queueKey(DatabaseExecutor db, StoreEvent e) async {
     final stable = _present(e.queueId);
@@ -606,13 +638,19 @@ extension _AppleDelivery on ApplePayments {
       return (
         key: key,
         id: id,
-        keep: savedQueue?['finished'] != 1,
-        absorbed: !inconsistent && provisional != null ? handle : null
+        keep: !inconsistent && savedQueue?['finished'] != 1,
+        alias: !inconsistent && handle != null && handle != key ? handle : null
       );
     });
-    if (id.absorbed case final handle?) {
+    if (id.alias case final handle?) {
       _handleAliases[handle] = id.key;
       _live.remove(handle);
+      if (_closingItems[handle] case final work?) {
+        _closingItems.putIfAbsent(id.key, () => work);
+      }
+      if (_removedItems[handle] case final removed?) {
+        _removedItems[id.key] = removed;
+      }
     }
     if (id.keep) _live[id.key] = e;
     _changed();
@@ -716,12 +754,25 @@ extension _AppleDelivery on ApplePayments {
     return true;
   }
 
-  Future<void> _finishOne(String key, StoreEvent e, String? id) {
-    final busy = _closingItems[key];
+  Future<void> _finishOne(String key, StoreEvent e, String? id,
+      {String? unbound}) {
+    final object = _objectKey(e);
+    final busy = _closingItems[key] ?? _closingItems[object];
     if (busy != null) return busy;
-    final work = _finishRecorded(key, e, id).catchError((Object error) {
+    final removed = _removedItems[key] ?? _removedItems[object];
+    final operation = removed != null
+        ? _persistRemoval(removed)
+        : unbound != null
+            ? _finishUnboundRecorded(unbound, e)
+            : _finishRecorded(key, e, id);
+    late final Future<void> work;
+    work = operation.catchError((Object error) {
       _report(StateError('StoreKit finish requires retry'));
-      if (id == null) {
+      if (_removedItems.containsKey(key) || _removedItems.containsKey(object)) {
+        _defer('storage', retryPending);
+      } else if (unbound != null) {
+        _defer(key, () => _finishUnbound(unbound));
+      } else if (id == null) {
         _defer('unpaid/$key', () async {
           final current = _live[key];
           if (current != null &&
@@ -734,9 +785,10 @@ extension _AppleDelivery on ApplePayments {
         _retryLater(id);
       }
     }).whenComplete(() {
-      _closingItems.remove(key);
+      _closingItems.removeWhere((_, future) => identical(future, work));
     });
     _closingItems[key] = work;
+    _closingItems[object] = work;
     return work;
   }
 
@@ -826,6 +878,11 @@ extension _AppleDelivery on ApplePayments {
       } else if (p['ackRef'] == null || p['verifiedId'] == null) {
         return false;
       }
+      final disputedSource = await db.rawQuery(
+          """SELECT 1 FROM recovery.observation WHERE reason='originalSubmissionConflict'
+          AND (id=? OR (generation=? AND objectKey=?)) LIMIT 1""",
+          [observation, _generation, _objectKey(e)]);
+      if (disputedSource.isNotEmpty) return false;
       await _recordFinishAuthority(db, e,
           itemId: key, purchase: p, handoff: handoff);
       return true;
@@ -845,34 +902,141 @@ extension _AppleDelivery on ApplePayments {
       if (id != null) _retryLater(id);
       throw StateError('StoreKit finish requires retry');
     }
-    await _journal.write((db) async {
-      await db.update('queue_item', {'finished': 1, 'reason': null},
-          where: id == null
-              ? 'id=? AND status=? AND purchaseId IS NULL'
-              : 'id=? AND status=? AND purchaseId=?',
-          whereArgs: [key, e.status.name, if (id != null) id]);
-      if (id != null) {
-        await db.rawDelete(
-            '''DELETE FROM purchase_evidence WHERE purchaseId=? AND
-          EXISTS(SELECT 1 FROM purchase WHERE id=? AND disposition IS NOT NULL AND conflict=0)
-          AND NOT EXISTS(SELECT 1 FROM queue_item WHERE purchaseId=? AND finished=0)''',
-            [id, id, id]);
-        // Bound recovery observations keep identity and the adjudication trail.
-        // Their receipt bytes can be released once every exact item is closed.
-        await db.rawDelete(
-            '''DELETE FROM recovery.candidate WHERE observation IN (
-          SELECT id FROM recovery.observation WHERE boundEnvironment=? AND boundPurchase=?
-        ) AND EXISTS(SELECT 1 FROM purchase WHERE id=? AND disposition IS NOT NULL AND conflict=0)
-          AND NOT EXISTS(SELECT 1 FROM queue_item WHERE purchaseId=? AND finished=0)''',
-            [_environment, id, id, id]);
-      }
-    });
-    if (_sameFinishObject(_live[key], current)) _live.remove(key);
-    if (id == null) {
-      _timers.remove('unpaid/$key')?.cancel();
-      _delays.remove('unpaid/$key');
+    await _rememberRemoval(
+        (key: key, event: current, purchase: id, unbound: null));
+  }
+
+  Future<void> _rememberRemoval(_Removal removed) {
+    _removedItems[removed.key] = removed;
+    _removedItems[_objectKey(removed.event)] = removed;
+    if (_handleAliases[removed.key] case final canonical?) {
+      _removedItems[canonical] = removed;
     }
+    return _persistRemoval(removed);
+  }
+
+  Future<void> _persistRemoval(_Removal removed) async {
+    final e = removed.event;
+    final object = _objectKey(e);
+    final result = await _journal.write((db) async {
+      final key = _handleAliases[removed.key] ?? removed.key;
+      final observations = <String>{};
+      _Row? completedQueue;
+      if (removed.unbound case final observation?) {
+        final rows = await db.rawQuery(
+            'SELECT id FROM recovery.observation WHERE id=? AND generation=? AND objectKey=? AND status=?',
+            [observation, _generation, object, e.status.name]);
+        if (rows.isEmpty) {
+          throw StateError('Missing removed StoreKit observation');
+        }
+        observations.add(observation);
+      } else {
+        final id = removed.purchase == null
+            ? null
+            : await _canonicalPurchaseId(db, removed.purchase!);
+        final q = await _row(db, 'queue_item', key);
+        if (q == null ||
+            q['purchaseId'] != id ||
+            q['productId'] != e.productId ||
+            q['status'] != e.status.name ||
+            _disagrees(q['reportedId'], _present(e.transactionId)) ||
+            _disagrees(q['storeQueueId'], _present(e.queueId)) ||
+            _disagrees(q['originalId'], _present(e.originalTransactionId)) ||
+            _disagrees(q['token'], _wire(e.token))) {
+          throw StateError(
+              'Removed StoreKit queue item has no verified journal target');
+        }
+        completedQueue = q;
+        final changed = await db.rawUpdate(
+            'UPDATE queue_item SET finished=1,reason=NULL WHERE id=? AND finished=0 AND status=? AND purchaseId IS ?',
+            [key, e.status.name, id]);
+        if (changed == 0 && q['finished'] != 1) {
+          throw StateError('StoreKit removal was not recorded');
+        }
+        if (id != null) {
+          final rows = await db.rawQuery(
+              """SELECT id,objectKey FROM recovery.observation WHERE generation=? AND status=?
+                AND boundEnvironment=? AND (boundPurchase=? OR boundPurchase IN
+                  (SELECT id FROM purchase_redirect WHERE purchaseId=?)) AND productId=?
+                AND (objectKey=? OR id=? OR queueId=?)""",
+              [
+                _generation,
+                e.status.name,
+                _configured ? _environment : 'compat',
+                id,
+                id,
+                e.productId,
+                object,
+                q['observation'],
+                q['storeQueueId']
+              ]);
+          for (final row in rows) {
+            final observation = row['id'] as String;
+            final candidate = _currentUnbound[observation];
+            if (row['objectKey'] == object ||
+                candidate != null &&
+                    _matchesRemovedQueue(candidate, e, q,
+                        boundObservation: observation == q['observation'])) {
+              observations.add(observation);
+            }
+          }
+          await db.rawDelete(
+              '''DELETE FROM purchase_evidence WHERE purchaseId=? AND
+              EXISTS(SELECT 1 FROM purchase WHERE id=? AND disposition IS NOT NULL AND conflict=0)
+              AND NOT EXISTS(SELECT 1 FROM queue_item WHERE purchaseId=? AND finished=0)''',
+              [id, id, id]);
+        }
+      }
+      for (final observation in observations) {
+        final changed = await db.rawUpdate(
+            'UPDATE recovery.observation SET finished=1 WHERE id=? AND generation=?',
+            [observation, _generation]);
+        if (changed != 1) {
+          throw StateError('StoreKit observation removal was not recorded');
+        }
+        await db.delete('recovery.candidate',
+            where: 'observation=?', whereArgs: [observation]);
+      }
+      return (key: key, queue: completedQueue, observations: observations);
+    });
+    _removedItems.removeWhere((_, pending) =>
+        identical(pending.event, e) && pending.key == removed.key);
+    for (final observation in result.observations) {
+      _currentUnbound.remove(observation);
+    }
+    final handle = _handleKey(e);
+    if (result.queue != null && handle != null && handle != result.key) {
+      _handleAliases[handle] = result.key;
+    }
+    final live = _live[result.key];
+    if (live != null &&
+        result.queue != null &&
+        _matchesRemovedQueue(live, e, result.queue!)) {
+      _live.remove(result.key);
+    }
+    final timerKey =
+        removed.unbound == null ? 'unpaid/${removed.key}' : removed.key;
+    _timers.remove(timerKey)?.cancel();
+    _delays.remove(timerKey);
     _changed();
+  }
+
+  bool _matchesRemovedQueue(
+      StoreEvent candidate, StoreEvent removed, _Row queue,
+      {bool boundObservation = false}) {
+    final object = _objectKey(candidate);
+    final exact = object == _objectKey(removed);
+    final alias = _handleAliases[object] == queue['id'];
+    final linked = boundObservation &&
+        candidate.queueId != null &&
+        candidate.queueId == queue['storeQueueId'];
+    return (exact || alias || linked) &&
+        candidate.status.name == queue['status'] &&
+        candidate.productId == queue['productId'] &&
+        !_disagrees(queue['storeQueueId'], candidate.queueId) &&
+        !_disagrees(queue['reportedId'], candidate.transactionId) &&
+        !_disagrees(queue['originalId'], candidate.originalTransactionId) &&
+        !_disagrees(queue['token'], _wire(candidate.token));
   }
 
   Future<void> _finishPurchase(String id) async {
@@ -903,12 +1067,19 @@ extension _AppleDelivery on ApplePayments {
   }
 
   Future<void> _processPurchase(String id) async {
+    if (_unwrittenTimeouts.containsKey(id)) {
+      await _saveTimeout(id);
+      if (_unwrittenTimeouts.containsKey(id)) return;
+    }
     final inputs = await _journal.read((db) async {
       final p = await _row(db, 'purchase', id);
+      final cursor = p?['scope'] == null ? null : p?['lastTimeoutSeq'];
       final evidence = await db.rawQuery('''
-        SELECT e.body,x.hash FROM purchase_evidence x JOIN evidence e ON e.hash=x.hash
+        SELECT e.body,x.hash,x.seq FROM purchase_evidence x JOIN evidence e ON e.hash=x.hash
         WHERE x.purchaseId=? AND x.rejected=0 AND (? IS NOT NULL OR x.storeObserved=1)
-        ORDER BY (x.tried=0) DESC,x.seq DESC''', [id, p?['scope']]);
+          AND $_canDeliverEvidence
+        ORDER BY CASE WHEN ? IS NULL THEN (x.tried=0) ELSE (x.seq<?) END DESC,
+                 x.seq DESC''', [id, p?['scope'], cursor, cursor]);
       final primary = p?['orderId'] == null
           ? null
           : (await db.query('order_primary',
@@ -972,7 +1143,8 @@ extension _AppleDelivery on ApplePayments {
             purchaseToken: p['token'] as String?,
             receipt: body,
             additionalCharge: inputs.additional);
-        step = await _verifyCandidate(id, account!, version, hash, receipt);
+        step = await _verifyCandidate(
+            id, account!, version, hash, e['seq'] as int, receipt);
       }
       if (step == _CandidateResult.stop) return;
       retry |= step == _CandidateResult.retry;
@@ -1089,10 +1261,40 @@ extension _AppleDelivery on ApplePayments {
     }
   }
 
+  Future<void> _saveTimeout(String id) async {
+    final pending = _unwrittenTimeouts[id]!;
+    try {
+      final saved = await _journal.write((db) async {
+        final p = await _row(db, 'purchase', id);
+        if (_closed ||
+            _account?._generation != pending.login ||
+            p == null ||
+            p['inputVersion'] != pending.version ||
+            p['disposition'] != null ||
+            _chargeOnHold(p)) {
+          return false;
+        }
+        return await db.rawUpdate('''
+          UPDATE purchase SET lastTimeoutSeq=?
+          WHERE id=? AND EXISTS(SELECT 1 FROM purchase_evidence x
+            WHERE purchaseId=? AND seq=? AND rejected=0 AND $_canDeliverEvidence)
+        ''', [pending.seq, id, id, pending.seq]) == 1;
+      });
+      _unwrittenTimeouts.remove(id);
+      if (saved && !_closed && _account?._generation == pending.login) {
+        _cooldowns[id] = (pending.login, pending.version);
+        _retryLater(id);
+      }
+    } catch (error) {
+      _report(error);
+      _defer('storage', retryPending);
+    }
+  }
+
   Future<_CandidateResult> _verifyCandidate(String id, AppleAccount account,
-      int version, String hash, AppleReceipt receipt) async {
+      int version, String hash, int seq, AppleReceipt receipt) async {
     final call = _VerificationCall(account, version, hash);
-    final p = await _journal.read((db) => _row(db, 'purchase', id));
+    final p = await _journal.read((db) => _verifierInput(db, id, hash));
     if (_closed ||
         !identical(_account, account) ||
         p == null ||
@@ -1102,18 +1304,20 @@ extension _AppleDelivery on ApplePayments {
       return _CandidateResult.stop;
     }
     _calls[id] = call;
+    Future<void>? timeoutWrite;
     final timeout = _timer(_verificationTimeout, () {
-      if (!call.retired.isCompleted) {
-        call.retire();
-        _cooldowns[id] = (account._generation, version);
-        _retryLater(id);
-      }
+      if (call.retired.isCompleted) return;
+      call.retire();
+      _unwrittenTimeouts[id] =
+          (login: account._generation, version: version, seq: seq);
+      timeoutWrite = _saveTimeout(id);
     });
     final response =
         Future.sync(() => account._verify(receipt)).catchError((Object _) {
       _report(StateError('Apple receipt verification requires retry'));
       return const AppleVerification.retryLater();
     }).then((result) {
+      timeout.cancel();
       if (_closed) return Future.value(_CandidateResult.stop);
       final applying = _applyVerification(id, call, receipt, result)
           .catchError((Object error) {
@@ -1129,6 +1333,9 @@ extension _AppleDelivery on ApplePayments {
           [response, call.retired.future.then((_) => _CandidateResult.stop)]);
     } finally {
       timeout.cancel();
+      // The deadline retires the callback immediately, but a new verifier must
+      // not observe the old cursor while this write is in flight.
+      await timeoutWrite;
       if (identical(_calls[id], call)) _calls.remove(id);
     }
   }
@@ -1153,7 +1360,7 @@ extension _AppleDelivery on ApplePayments {
       return _CandidateResult.stop;
     }
     final applied = await _journal.write((db) async {
-      final p = await _row(db, 'purchase', id);
+      final p = await _verifierInput(db, id, call.hash);
       if (_closed ||
           call.retired.isCompleted ||
           !identical(_calls[id], call) ||
@@ -1469,8 +1676,10 @@ extension _AppleDelivery on ApplePayments {
           Uuid.isValidUUID(fromString: c.purchaseToken!));
 
   Future<String?> _applyClaim(DatabaseExecutor db, AppleClaim c,
-      {_Row? decidedAttempt, Set<String>? affected}) async {
-    await _bindObservation(db, c);
+      {_Row? decidedAttempt,
+      Set<String>? affected,
+      _Row? exactObservation}) async {
+    await _bindObservation(db, c, exact: exactObservation);
     var p = await _reportedPurchase(db, c.reportedTransactionId);
     if (p == null) {
       if (decidedAttempt == null) throw StateError('Unknown Apple transaction');
@@ -1510,7 +1719,8 @@ extension _AppleDelivery on ApplePayments {
         throw StateError(
             'Reviewed identity already belongs to another Apple charge');
       }
-      return _reviewDispute(db, canonical, p, c, affected);
+      return _reviewDispute(db, canonical, p, c, affected,
+          exactObservation: exactObservation);
     }
     if (const {'environmentMismatch', 'environmentConflict'}
             .contains(canonical['reason']) ||
@@ -1640,6 +1850,8 @@ extension _AppleDelivery on ApplePayments {
           if (current['attemptId'] == null && selected != null)
             'attemptId': selected['id'],
           if (current['token'] == null && token != null) 'token': token,
+          if (exactObservation != null && current['reportedId'] == null)
+            'reportedId': c.reportedTransactionId,
           if (current['claimRef'] == null) 'claimRef': c.reference,
           'conflict': 0,
           if (current['reason'] != 'needsReconciliation' ||
@@ -1658,7 +1870,7 @@ extension _AppleDelivery on ApplePayments {
         : null;
     await _reservePrimary(db, c.scope, c.orderId,
         legacyPrimary?['purchaseId'] as String? ?? target);
-    await _authorizeObservation(db, c, target);
+    await _authorizeObservation(db, c, target, exact: exactObservation);
     await _closeSettledAttempt(db, target);
     if (ack != null) {
       return _recordDisposition(db, (await _row(db, 'purchase', target))!, ack);
@@ -1733,7 +1945,8 @@ extension _AppleDelivery on ApplePayments {
   }
 
   Future<String?> _reviewDispute(DatabaseExecutor db, _Row p, _Row source,
-      AppleClaim c, Set<String> affected) async {
+      AppleClaim c, Set<String> affected,
+      {bool authorizeItems = true, _Row? exactObservation}) async {
     final r = c.review!;
     final id = p['id'] as String;
     if ([r.issuer, r.decisionId, r.reference].any((s) => s.trim().isEmpty) ||
@@ -1928,7 +2141,9 @@ extension _AppleDelivery on ApplePayments {
       await _replacePrimaryAfterReview(db, p, affected);
     }
     await _reservePrimary(db, c.scope, c.orderId, id);
-    if (!foreign) await _authorizeObservation(db, c, id);
+    if (!foreign && authorizeItems) {
+      await _authorizeObservation(db, c, id, exact: exactObservation);
+    }
     return id;
   }
 

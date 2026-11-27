@@ -104,6 +104,35 @@ void main() {
     }
   });
 
+  test('an authenticated original UUID cannot be issued to a new attempt',
+      () async {
+    const token = '423f1231-7c53-480f-b73e-614a2b278c06';
+    final proof = {
+      'appId': 'app',
+      'token': token,
+      'issuer': 'server',
+      'reference': 'registration-1',
+      'environment': 'sandbox',
+      'scope': 'A',
+      'orderId': '1',
+      'productId': 'coffee',
+      'verifiedId': 'V',
+      'reportedId': 'T',
+    };
+    await journal.select('app', 'sandbox');
+    await journal.write((db) async {
+      await db.insert('recovery.original_submission', proof);
+    });
+    await journal.close();
+    await journal.select('app', 'production');
+    await expectLater(
+        journal.write((db) =>
+            reserveAppleToken(db, token.toUpperCase(), 'production', 'new')),
+        throwsStateError);
+    expect(
+        await journal.read((db) => db.query('recovery.submission')), isEmpty);
+  });
+
   test('the verified Apple identity is unique across local purchases',
       () async {
     await journal.write((db) async {
@@ -182,6 +211,91 @@ void main() {
     await journal.select(null, null);
     expect((await journal.read((db) => db.query('purchase'))).single['id'],
         'legacy');
+  });
+
+  test('v5 partitions preserve pending charges and migrate atomically to v6',
+      () async {
+    // Save a paid, unconfirmed queue item in each environment; recreate the v5
+    // schema rather than just changing user_version on a current database.
+    for (final env in ['sandbox', 'production']) {
+      await journal.select('app', env);
+      await journal.write((db) async {
+        await purchase(db, env);
+        await db.insert('queue_item', {
+          'id': 'queue-$env',
+          'purchaseId': env,
+          'status': 'paid',
+          'productId': 'coffee',
+        });
+      });
+    }
+    await journal.close();
+    for (final path in [file.path, '${file.path}.production']) {
+      final old = await openDatabase(path);
+      await old.transaction((db) async {
+        await db.execute('DROP TRIGGER reset_timeout_cursor');
+        await db.execute('ALTER TABLE purchase DROP COLUMN lastTimeoutSeq');
+        await db.execute('PRAGMA user_version=5');
+      });
+      await old.close();
+    }
+    final recovery = await openDatabase('${file.path}.observations');
+    await recovery.execute('DROP TABLE observation_review');
+    await recovery.execute('DROP TABLE original_submission');
+    await recovery.close();
+
+    // Force the identity check to fail before the schema transaction commits.
+    final bad = await openDatabase(file.path);
+    await bad.update('meta', {'revision': 7, 'appId': ' '});
+    await bad.close();
+    await expectLater(journal.select('app', 'sandbox'), throwsStateError);
+    final uncommitted = await openDatabase('${file.path}.observations');
+    expect(
+        await uncommitted.rawQuery(
+            "SELECT name FROM sqlite_master WHERE name IN ('original_submission','observation_review')"),
+        isEmpty);
+    await uncommitted.close();
+    final repair = await openDatabase(file.path);
+    expect(await repair.getVersion(), 5);
+    expect(
+        (await repair.rawQuery('PRAGMA table_info(purchase)'))
+            .map((c) => c['name']),
+        isNot(contains('lastTimeoutSeq')));
+    await repair.update('meta', {'appId': 'app'});
+    await repair.close();
+
+    for (final env in ['production', 'sandbox', 'production']) {
+      await journal.select('app', env);
+      await journal.read((db) async {
+        expect(
+            (await db.rawQuery('PRAGMA user_version')).single.values.single, 6);
+        final charge = (await db.query('purchase')).single;
+        expect(charge['id'], env);
+        expect(charge['lastTimeoutSeq'], isNull);
+        expect((await db.query('queue_item')).single['finished'], 0);
+        expect(await db.query('recovery.original_submission'), isEmpty);
+        expect(await db.query('recovery.observation_review'), isEmpty);
+      });
+      await journal.close();
+    }
+  });
+
+  test('a v6 ledger detects a mismatched recovery file during startup',
+      () async {
+    await journal.select('app', 'sandbox');
+    await journal.write((db) => purchase(db, 'paid'));
+    await journal.close();
+    final sidecar = await openDatabase('${file.path}.observations');
+    await sidecar.execute('DROP TABLE observation_review');
+    await sidecar.close();
+
+    await expectLater(
+        journal.select('app', 'sandbox'),
+        throwsA(isA<StateError>().having(
+            (e) => e.message, 'message', 'Incomplete Apple recovery ledger')));
+    final main = await openDatabase(file.path);
+    expect((await main.query('purchase')).single['id'], 'paid');
+    await main.close();
   });
 
   test('an empty partition cannot hide an unversioned empty table', () async {

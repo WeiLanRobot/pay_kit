@@ -174,16 +174,29 @@ extension _AppleEnvironment on ApplePayments {
                 previous['status'] != e.status.name ||
             previous['productId'] != e.productId ||
             _disagrees(previous['token'], _wire(e.token)) ||
-            _disagrees(previous['reportedId'], _present(e.transactionId))) {
+            _disagrees(previous['reportedId'], _present(e.transactionId)) ||
+            _disagrees(previous['queueId'], _present(e.queueId)) ||
+            _disagrees(
+                previous['originalId'], _present(e.originalTransactionId))) {
           await db.rawUpdate(
               "UPDATE recovery.observation SET reason='identityConflict' WHERE id=?",
               [id]);
           return (owned: false, id: id, finished: true, ownsFailure: false);
         }
+        if (previous['finished'] == 1) {
+          return (owned: false, id: id, finished: true, ownsFailure: false);
+        }
         if (previous['boundEnvironment'] == _environment &&
             previous['boundPurchase'] != null &&
             previous['reason'] != 'identityConflict' &&
+            previous['reason'] != 'originalSubmissionConflict' &&
             _currentUnbound.containsKey(id)) {
+          // A fresh native handle can reuse a completed StoreKit report.
+          // Its recovered row has a separate key even when the SKU and report
+          // are identical. Keep subsequent messages on that exact observation.
+          if (await _row(db, 'queue_item', 'replay/$id') != null) {
+            return (owned: false, id: id, finished: false, ownsFailure: false);
+          }
           return (owned: true, id: id, finished: false, ownsFailure: false);
         }
         await db.rawUpdate(
@@ -231,50 +244,37 @@ extension _AppleEnvironment on ApplePayments {
   }
 
   Future<void> _finishUnbound(String id) async {
-    final key = 'unbound/$id';
-    if (_closingItems.containsKey(key)) return;
-    final work = () async {
-      final authorized = await _journal.write((db) async {
-        final e = _currentUnbound[id];
-        if (!_ready || _closed || e == null) return null;
-        final permitted = await db.rawQuery(
-            """SELECT 1 FROM recovery.observation WHERE id=? AND generation=?
-               AND objectKey=? AND status=? AND status IN ('canceled','failed')
-               AND finished=0 AND reason='ownedFailure'""",
-            [id, _generation, _objectKey(e), e.status.name]);
-        if (permitted.isEmpty) return null;
-        // A delayed retry can run after new payment or conflict evidence arrived.
-        if (!e.allowsUnownedFinish &&
-            !await _ownsUnboundFailure(
-                db, e, await _attemptForToken(db, _wire(e.token)))) {
-          return null;
-        }
-        await _recordFinishAuthority(db, e, itemId: id);
-        return e;
-      });
-      // A replay can replace the Dart wrapper for the same native object.
-      final e = _currentUnbound[id];
-      if (!_ready || _closed || e == null || authorized == null) return;
-      if (!_sameFinishObject(e, authorized)) {
-        throw StateError('StoreKit finish observation changed');
+    final e = _currentUnbound[id];
+    if (e != null) await _finishOne('unbound/$id', e, null, unbound: id);
+  }
+
+  Future<void> _finishUnboundRecorded(String id, StoreEvent e) async {
+    final permitted = await _journal.write((db) async {
+      final rows = await db.rawQuery(
+          """SELECT 1 FROM recovery.observation WHERE id=? AND generation=?
+             AND objectKey=? AND status=? AND status IN ('canceled','failed')
+             AND finished=0 AND reason='ownedFailure'""",
+          [id, _generation, _objectKey(e), e.status.name]);
+      if (rows.isEmpty || !_sameFinishObject(_currentUnbound[id], e)) {
+        return false;
       }
-      if (e.needsFinish) await _store.finish(e);
-      await _journal.write((db) => db.rawUpdate(
-          'UPDATE recovery.observation SET finished=1 WHERE id=? AND status=?',
-          [id, e.status.name]));
-      _currentUnbound.remove(id);
-      _timers.remove(key)?.cancel();
-      _delays.remove(key);
-      _changed();
-    }()
-        .catchError((Object error) {
-      _report(error);
-      _defer(key, () => _finishUnbound(id));
-    }).whenComplete(() {
-      _closingItems.remove(key);
+      if (!e.allowsUnownedFinish &&
+          !await _ownsUnboundFailure(
+              db, e, await _attemptForToken(db, _wire(e.token)))) {
+        return false;
+      }
+      await _recordFinishAuthority(db, e, itemId: id);
+      return true;
     });
-    _closingItems[key] = work;
-    await work;
+    if (!permitted ||
+        !_ready ||
+        _closed ||
+        !_sameFinishObject(_currentUnbound[id], e)) {
+      return;
+    }
+    if (e.needsFinish) await _store.finish(e);
+    await _rememberRemoval(
+        (key: 'unbound/$id', event: e, purchase: null, unbound: id));
   }
 
   AppleEnvironmentMismatch _decodeEnvironmentProof(String payload) {
@@ -384,8 +384,9 @@ extension _AppleEnvironment on ApplePayments {
 
   Future<List<_Row>> _claimObservations(
       DatabaseExecutor db, AppleClaim c) async {
-    final rows = await db
-        .rawQuery("""SELECT * FROM recovery.observation WHERE reportedId=?
+    final rows = await db.rawQuery(
+        """SELECT observation.*, EXISTS(SELECT 1 FROM recovery.observation_review v
+        WHERE v.observation=observation.id) AS reviewed FROM recovery.observation WHERE reportedId=?
       AND productId=? AND status='paid' AND reason NOT IN ('identityConflict','environmentRejected','environmentConflict','compatibilityTransferred')
       AND (actual IS NULL OR actual=?) AND (verifiedId IS NULL OR verifiedId=?)
       AND (boundEnvironment IS NULL OR boundEnvironment=?)
@@ -395,14 +396,15 @@ extension _AppleEnvironment on ApplePayments {
         WHERE legacy.generation='compatibility' AND legacy.reason!='compatibilityTransferred'
           AND legacy.token=observation.token AND legacy.reportedId=observation.reportedId
           AND legacy.productId=observation.productId AND legacy.actual!=?)
-      ORDER BY (generation='compatibility') DESC, rowid""", [
-      c.reportedTransactionId,
-      c.productId,
-      c.environment,
-      c.verifiedTransactionId,
-      c.environment,
-      c.environment
-    ]);
+      ORDER BY (generation='compatibility') DESC, rowid""",
+        [
+          c.reportedTransactionId,
+          c.productId,
+          c.environment,
+          c.verifiedTransactionId,
+          c.environment,
+          c.environment
+        ]);
     final token = _wire(c.purchaseToken);
     if (token != null &&
         (await db.rawQuery(
@@ -428,14 +430,39 @@ extension _AppleEnvironment on ApplePayments {
       throw StateError(
           'Apple recovery observation does not match the authenticated claim');
     }
-    if (candidates.length <= 1) return candidates;
-    // Identical device IDs across observations are insufficient. A verified UUID
-    // can independently identify a replay bearing that same token.
-    return candidates
-        .where((r) =>
-            r['id'] == c.observationId && r['actual'] == c.environment ||
-            token != null && r['token'] == token)
-        .toList();
+    if (candidates.isEmpty) return candidates;
+    // Count historical observations before filtering on claimed environment or
+    // token. Resolving one candidate cannot make another's origin self-evident.
+    final several = (await db.rawQuery(
+            "SELECT 1 FROM recovery.observation WHERE reportedId=? AND productId=? AND status='paid' LIMIT 1 OFFSET 1",
+            [c.reportedTransactionId, c.productId]))
+        .isNotEmpty;
+    final allowed = <_Row>[];
+    for (final r in candidates) {
+      if (r['generation'] == 'verified' && r['originLinked'] != 1) continue;
+      if (!several && r['reviewed'] == 0 ||
+          r['generation'] == 'compatibility' ||
+          r['generation'] == 'verified' &&
+              r['actual'] == c.environment &&
+              r['originLinked'] == 1 ||
+          await _sourceForObservation(db, c, r)) {
+        allowed.add(r);
+      }
+    }
+    if (allowed.isEmpty ||
+        c.observationId != null &&
+            !allowed.any((r) => r['id'] == c.observationId)) {
+      throw AppleAmbiguousObservation();
+    }
+    // A legacy reconciliation naming a signed environment correction keeps
+    // its established behavior for current items independently linked by UUID.
+    final selected =
+        allowed.where((r) => r['id'] == c.observationId).firstOrNull;
+    if (selected == null ||
+        selected['generation'] == 'verified' && selected['originLinked'] == 1) {
+      return allowed;
+    }
+    return [selected];
   }
 
   Future<void> _bindExactObservation(
@@ -473,7 +500,8 @@ extension _AppleEnvironment on ApplePayments {
         !_disagrees(attempt['scope'], c.scope);
   }
 
-  Future<void> _bindObservation(DatabaseExecutor db, AppleClaim c) async {
+  Future<void> _bindObservation(DatabaseExecutor db, AppleClaim c,
+      {_Row? exact}) async {
     final frozen = await db.rawQuery(
         '''SELECT 1 FROM recovery.observation WHERE actual=? AND verifiedId=?
         AND (reason='environmentConflict' OR (reason='environmentRejected'
@@ -489,7 +517,8 @@ extension _AppleEnvironment on ApplePayments {
     if (frozen.isNotEmpty) {
       throw StateError('Conflicting Apple environment proof');
     }
-    final candidates = await _claimObservations(db, c);
+    final candidates =
+        exact == null ? await _claimObservations(db, c) : [exact];
     if (candidates.any((row) => row['reason'] == 'environmentSelected')) {
       final existing = (await db.query('purchase',
               where: 'appId=? AND environment=? AND verifiedId=?',
@@ -582,8 +611,10 @@ extension _AppleEnvironment on ApplePayments {
   }
 
   Future<void> _authorizeObservation(
-      DatabaseExecutor db, AppleClaim c, String target) async {
-    final candidates = await _claimObservations(db, c);
+      DatabaseExecutor db, AppleClaim c, String target,
+      {_Row? exact}) async {
+    final candidates =
+        exact == null ? await _claimObservations(db, c) : [exact];
     await _restoreCompatibilityHandoff(db, c, target);
     final p = (await _row(db, 'purchase', target))!;
     final token = _wire(c.purchaseToken);
@@ -634,13 +665,15 @@ extension _AppleEnvironment on ApplePayments {
           r['generation'] == _generation &&
           c.reportedTransactionId != p['reportedId'] &&
           c.verifiedTransactionId == p['verifiedId'];
-      if ((p['disposition'] != null || r['priorIdentity'] == 1) &&
+      if (exact == null &&
+          (p['disposition'] != null || r['priorIdentity'] == 1) &&
           !signedReplay &&
           !originProof &&
           !newAlias &&
           r['boundEnvironment'] == null) {
         continue;
       }
+      if (r['finished'] == 1) continue;
       final id = r['id'] as String;
       final evidence = await db.rawQuery(
           '''SELECT b.body,c.source,c.context FROM recovery.body b
@@ -651,13 +684,41 @@ extension _AppleEnvironment on ApplePayments {
             source: item['source'] as String,
             context: item['context'] as String);
       }
-      await db.rawUpdate(
-          'UPDATE recovery.observation SET boundEnvironment=?, boundPurchase=? WHERE id=?',
-          [c.environment, target, id]);
+      final external = exact != null &&
+          (await db.rawQuery(
+                  """SELECT 1 FROM recovery.original_submission WHERE appId=? AND token=? AND environment=?
+           AND verifiedId=? AND reportedId=? AND NOT EXISTS (
+              SELECT 1 FROM recovery.submission WHERE token=?) LIMIT 1""",
+                  [
+                c.appId,
+                token,
+                c.environment,
+                c.verifiedTransactionId,
+                c.reportedTransactionId,
+                token
+              ]))
+              .isNotEmpty;
+      await db.update(
+          'recovery.observation',
+          {
+            'boundEnvironment': c.environment,
+            'boundPurchase': target,
+            if (external) 'reason': 'originalSubmission',
+          },
+          where: 'id=?',
+          whereArgs: [id]);
       final e = _currentUnbound[id];
       if (r['generation'] != _generation || e == null) continue;
-      final key = await _queueKey(db, e);
-      final prior = await _row(db, 'queue_item', key);
+      var key = await _queueKey(db, e);
+      var prior = await _row(db, 'queue_item', key);
+      var queueId = r['queueId'];
+      if (prior?['finished'] == 1 && prior?['observation'] != id) {
+        // This handle is live now. A completed row keyed by the same device
+        // report cannot attest removal of the newly authorized native object.
+        key = 'replay/$id';
+        queueId = null;
+        prior = await _row(db, 'queue_item', key);
+      }
       if (prior == null) {
         await db.insert('queue_item', {
           'id': key,
@@ -666,7 +727,7 @@ extension _AppleEnvironment on ApplePayments {
           'reportedId': c.reportedTransactionId,
           'token': r['token'],
           'status': 'paid',
-          'storeQueueId': r['queueId'],
+          'storeQueueId': queueId,
           'attemptId': p['attemptId'],
           'observation': id
         });
