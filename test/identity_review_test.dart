@@ -172,6 +172,17 @@ void main() {
           });
       final token = await buy();
       await started.future;
+      final lateFinancial = Completer<AppleVerification>();
+      if (!keepSource) {
+        final verifying = Completer<void>();
+        a = pay.connect(
+            scope: 'A',
+            verify: (_) {
+              verifying.complete();
+              return lateFinancial.future;
+            });
+        await verifying.future;
+      }
       AppleDisposition sourceAck(String ref,
               {AppleOutcome outcome = AppleOutcome.delivered,
               String? supersedes}) =>
@@ -243,6 +254,27 @@ void main() {
       expect((await a.lookup('O'))!.charges.single.conflict, false);
       expect(store.finished.length, keepSource ? 1 : 0);
       if (!keepSource) {
+        lateFinancial
+            .complete(AppleVerification.delivered(sourceAck('late-grant')));
+        await pay.settle();
+        final financial =
+            (await pay.unmatched()).singleWhere((r) => r.disputeId != null);
+        expect(financial.environmentProofs, isEmpty);
+        await pay.recordPayment(source(
+            review: AppleDisputeReview(
+          issuer: 'orders',
+          decisionId: 'late-grant-compensation',
+          disputeId: financial.id,
+          revision: financial.disputeRevision!,
+          reference: 'corrected fulfillment',
+          coveredReceipts: financial.receiptReferences,
+          finalDisposition:
+              sourceAck('late-grant-refund', outcome: AppleOutcome.refunded),
+        )));
+        await pay.settle();
+        expect(store.finished, isEmpty);
+        expect((await a.lookup('O'))!.charges.single.reason,
+            'environmentMismatch');
         final later = source(
             disposition:
                 sourceAck('another-refund', outcome: AppleOutcome.refunded));

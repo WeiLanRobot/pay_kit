@@ -373,16 +373,20 @@ Future<void> _saveClaim(DatabaseExecutor db, _Row p, AppleClaim c) => db.insert(
     conflictAlgorithm: ConflictAlgorithm.ignore);
 
 Future<void> _openDispute(
-    DatabaseExecutor db, _Row p, String reason, String evidence) async {
+    DatabaseExecutor db, _Row p, String reason, String evidence,
+    {bool newEnvironmentProof = false}) async {
   final existing = await db.query('conflict_fact',
       columns: ['id'],
       where: 'purchaseId=? AND reason=? AND evidenceRef=?',
       whereArgs: [p['id'], reason, evidence]);
   if (existing.isNotEmpty) return;
   if (reason == 'environmentConflict') {
+    // A late financial receipt can dispute an undecided source. Revisiting an
+    // already selected environment needs new authenticated environment evidence.
     await db.rawUpdate(
-        "UPDATE recovery.observation SET reason=? WHERE $_sourcePurchases AND reason!='environmentRejected'",
-        [reason, p['id'], p['id']]);
+        """UPDATE recovery.observation SET reason=? WHERE $_sourcePurchases
+          AND (reason='environmentMismatch' OR (?=1 AND reason='environmentSelected'))""",
+        [reason, p['id'], p['id'], newEnvironmentProof ? 1 : 0]);
   }
   await _conflict(db, p, null, reason, evidence);
   await db.rawUpdate(

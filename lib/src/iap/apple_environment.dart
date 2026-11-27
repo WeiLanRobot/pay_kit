@@ -920,7 +920,8 @@ extension _AppleEnvironment on ApplePayments {
       if (p['disposition'] != null ||
           p['verifiedId'] != null ||
           different.isNotEmpty) {
-        await _openDispute(db, p, 'environmentConflict', payload);
+        await _openDispute(db, p, 'environmentConflict', payload,
+            newEnvironmentProof: true);
       } else {
         await db.update('purchase', {'reason': 'environmentMismatch'},
             where: 'id=?', whereArgs: [canonical]);
