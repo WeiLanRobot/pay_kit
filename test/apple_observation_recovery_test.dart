@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:sqflite/sqflite.dart';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -37,7 +39,10 @@ void main() {
   }
 
   Future<String> observe(String handle,
-      {String? wire, String reported = 'R'}) async {
+      {String? wire,
+      String reported = 'R',
+      String receipt = 'shared',
+      bool allowsUnownedFinish = true}) async {
     store.stream.add([
       StoreEvent(
           productId: 'sku',
@@ -45,7 +50,8 @@ void main() {
           native: handle,
           transactionId: reported,
           queueId: reported,
-          receipt: 'shared',
+          receipt: receipt,
+          allowsUnownedFinish: allowsUnownedFinish,
           status: StoreStatus.paid)
     ]);
     await pay.settle();
@@ -108,6 +114,25 @@ void main() {
           purchaseToken: wire,
           reportedTransactionId: report,
           verifiedTransactionId: verified);
+
+  AppleVerifiedQueueTransaction verifiedItem(String observation,
+          {String transaction = 'R',
+          String owner = 'A',
+          String environment = 'sandbox',
+          String receipt = 'shared',
+          int quantity = 1,
+          String? reference}) =>
+      AppleVerifiedQueueTransaction(
+          observationId: observation,
+          receiptHash: sha256.convert(utf8.encode(receipt)).toString(),
+          transactionId: transaction,
+          appId: 'app',
+          environment: environment,
+          productId: 'sku',
+          scope: owner,
+          orderId: 'order',
+          quantity: quantity,
+          reference: reference ?? 'verified-$observation');
   setUp(() async {
     dir = await Directory.systemTemp.createTemp('apple-observation');
     verifications = 0;
@@ -276,6 +301,211 @@ void main() {
     await pay.settle();
     expect(store.finished, hasLength(1));
     expect(verifications, 0);
+  });
+
+  test('legacy replay finishes only the verified item on a shared app receipt',
+      () async {
+    final prior = await observe('previous-run', wire: 'order');
+    await close();
+    await start();
+    final current = await observe('current', wire: 'order');
+    final other = await observe('other', wire: 'another-order', reported: 'R2');
+    final proof = verifiedItem(current);
+    final currentClaim = claim(current, verified: 'R');
+    await expectLater(
+        pay.reconcile(currentClaim), throwsA(isA<AppleAmbiguousObservation>()));
+    expect((await pay.recoverObservation(currentClaim)).state,
+        AppleObservationState.sourceUnproven);
+
+    await expectLater(
+        pay.recoverObservation(claim(other, report: 'R2', verified: 'R2'),
+            verifiedQueueTransaction: proof),
+        throwsStateError);
+    await expectLater(
+        pay.recoverObservation(claim(other, report: 'R2', verified: 'R2'),
+            verifiedQueueTransaction: verifiedItem(other, transaction: 'R2')),
+        throwsStateError);
+    await expectLater(
+        pay.recoverObservation(claim(current, owner: 'B', verified: 'R'),
+            verifiedQueueTransaction: verifiedItem(current, owner: 'B')),
+        throwsStateError);
+    await expectLater(
+        pay.recoverObservation(currentClaim,
+            verifiedQueueTransaction: verifiedItem(prior)),
+        throwsStateError);
+    await pay.recoverObservation(currentClaim, verifiedQueueTransaction: proof);
+    await pay.settle();
+    expect(
+        (await pay.recoverObservation(currentClaim,
+                verifiedQueueTransaction: proof))
+            .state,
+        AppleObservationState.removed);
+    await pay.settle();
+    expect(store.finished.map((e) => e.native), ['current']);
+    expect((await account.lookup('order'))!.charges.single.reference, 'ack');
+    expect(verifications, 0);
+  });
+
+  test('restart reuses delivery but requires fresh proof for the replay',
+      () async {
+    final old = await observe('old', wire: 'order');
+    final oldProof = verifiedItem(old);
+    store.failFinish = true;
+    await pay.recoverObservation(claim(old, verified: 'R'),
+        verifiedQueueTransaction: oldProof);
+    await pay.settle();
+    expect(store.finished, isEmpty);
+    await close();
+    await start();
+    final replay = await observe('replay', wire: 'order');
+    final existing = claim(replay, verified: 'R', terminal: false);
+    expect((await pay.recoverObservation(existing)).state,
+        AppleObservationState.sourceUnproven);
+    await expectLater(
+        pay.recoverObservation(existing, verifiedQueueTransaction: oldProof),
+        throwsStateError);
+    await expectLater(
+        pay.recoverObservation(existing,
+            verifiedQueueTransaction:
+                verifiedItem(replay, reference: oldProof.reference)),
+        throwsStateError);
+    await pay.retryPending();
+    await pay.settle();
+    expect(store.finished, isEmpty);
+    await pay.recoverObservation(existing,
+        verifiedQueueTransaction: verifiedItem(replay));
+    await pay.settle();
+    expect(store.finished.map((e) => e.native), ['replay']);
+    expect((await account.lookup('order'))!.charges.single.reference, 'ack');
+    expect(
+        await journal.read((db) => db.query('disposition_fact')), hasLength(1));
+    expect(verifications, 0);
+  });
+
+  test('invalid queue proof leaves the observation and charge unassigned',
+      () async {
+    final excluded = await observe('outside-catalog',
+        reported: 'off-catalog', allowsUnownedFinish: false);
+    await expectLater(
+        pay.recoverObservation(
+            claim(excluded, report: 'off-catalog', verified: 'off-catalog'),
+            verifiedQueueTransaction:
+                verifiedItem(excluded, transaction: 'off-catalog')),
+        throwsStateError);
+    final id = await observe('candidate');
+    final matching = claim(id, verified: 'R');
+    for (final proof in [
+      verifiedItem(id, environment: 'production'),
+      verifiedItem(id, owner: 'B'),
+      verifiedItem(id, receipt: 'unrelated receipt'),
+      verifiedItem(id, transaction: 'other transaction'),
+      verifiedItem(id, quantity: 2),
+    ]) {
+      await expectLater(
+          pay.recoverObservation(matching, verifiedQueueTransaction: proof),
+          throwsStateError);
+    }
+    await expectLater(
+        pay.recoverObservation(claim(id),
+            verifiedQueueTransaction: verifiedItem(id)),
+        throwsStateError);
+    await expectLater(
+        pay.recoverObservation(claim(id, verified: 'R', terminal: false),
+            verifiedQueueTransaction: verifiedItem(id)),
+        throwsStateError);
+    final duplicate = await observe('different-current-handle');
+    expect(duplicate, isNot(id));
+    await expectLater(
+        pay.recoverObservation(matching,
+            verifiedQueueTransaction: verifiedItem(id)),
+        throwsStateError);
+    await pay.settle();
+    expect(store.finished, isEmpty);
+    expect(await account.lookup('order'), isNull);
+    expect(await journal.read((db) => db.query('queue_item')), isEmpty);
+    expect(await journal.read((db) => db.query('recovery.observation_review')),
+        isEmpty);
+  });
+
+  test('conflicting queue evidence blocks retry of an authorized finish',
+      () async {
+    final id = await observe('authorized', wire: 'order');
+    final c = claim(id, verified: 'R');
+    final proof = verifiedItem(id);
+    store.failFinish = true;
+    await pay.recoverObservation(c, verifiedQueueTransaction: proof);
+    await pay.settle();
+    expect(store.finished, isEmpty);
+
+    store.failFinish = false;
+    store.stream.add([
+      const StoreEvent(
+          productId: 'sku',
+          native: 'failed-object',
+          transactionId: 'R',
+          queueId: 'R',
+          token: 'order',
+          status: StoreStatus.failed),
+    ]);
+    await pay.settle();
+    await expectLater(
+        pay.recoverObservation(c, verifiedQueueTransaction: proof),
+        throwsStateError);
+    await pay.retryPending();
+    await pay.settle();
+    expect(store.finished.map((e) => e.native), isNot(contains('authorized')));
+    expect(
+        (await account.lookup('order'))!.charges.single.finishPending, isTrue);
+  });
+
+  test('original submission finishes its own handle when a queue ID is shared',
+      () async {
+    final pending = await observe('pending-handle');
+    store.failFinish = true;
+    await pay.recoverObservation(claim(pending, verified: 'R'),
+        verifiedQueueTransaction: verifiedItem(pending));
+    await pay.settle();
+    expect(store.finished, isEmpty);
+    await observe('pending-handle');
+    final other = await observe('original-handle', wire: token);
+    store.failFinish = false;
+    await pay.recoverObservation(claim(other, wire: token, verified: 'R'),
+        originalSubmission: original(verified: 'R'));
+    await pay.settle();
+    expect(store.finished.map((e) => e.native), ['original-handle']);
+    final observations = await journal.read(
+        (db) => db.query('recovery.observation', columns: ['id', 'finished']));
+    expect({for (final row in observations) row['id']: row['finished']},
+        {pending: 0, other: 1});
+    expect(
+        (await account.lookup('order'))!.charges.single.finishPending, isTrue);
+  });
+
+  test('refresh makes an empty receipt available for the current replay',
+      () async {
+    final old = await observe('old', receipt: '');
+    await close();
+    await start();
+    final live = await observe('live', receipt: '');
+    final rows = await pay.unmatched();
+    expect(rows.expand((r) => r.currentObservationIds), [live]);
+    final proof = verifiedItem(live, receipt: 'fresh');
+    final current = claim(live, verified: 'R');
+    await expectLater(
+        pay.recoverObservation(current, verifiedQueueTransaction: proof),
+        throwsStateError);
+    await pay.refreshReceipts();
+    await pay.settle();
+    final refreshed = (await pay.unmatched())
+        .singleWhere((r) => r.currentObservationIds.contains(live));
+    expect(refreshed.observations[live], contains('fresh'));
+    await expectLater(
+        pay.recoverObservation(claim(old, verified: 'R'),
+            verifiedQueueTransaction: verifiedItem(old, receipt: 'fresh')),
+        throwsStateError);
+    await pay.recoverObservation(current, verifiedQueueTransaction: proof);
+    await pay.settle();
+    expect(store.finished.map((e) => e.native), ['live']);
   });
 
   test(

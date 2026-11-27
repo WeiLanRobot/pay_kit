@@ -211,6 +211,7 @@ class AppleTransaction {
       required this.purchaseToken,
       required this.receipts,
       required this.observations,
+      this.currentObservationIds = const {},
       this.disputeId,
       this.disputeRevision,
       this.receiptReferences = const [],
@@ -221,6 +222,9 @@ class AppleTransaction {
   final String? transactionId, purchaseToken, reason;
   final List<String> receipts;
   final Map<String, List<String>> observations;
+
+  /// Observation IDs with a live StoreKit object at the time of this snapshot.
+  final Set<String> currentObservationIds;
   final String? disputeId;
   final int? disputeRevision;
   final List<String> receiptReferences;
@@ -262,6 +266,31 @@ class AppleOriginalSubmission {
   final String issuer, reference, appId, environment, scope, orderId, productId;
   final int quantity;
   final String purchaseToken, reportedTransactionId, verifiedTransactionId;
+}
+
+/// A statement from the host's authenticated verifier about a single paid
+/// consumable in the receipt for this observation. The verifier must establish
+/// ownership from its own order records and authenticate the Apple transaction,
+/// app, environment, product and quantity. A delivery receipt alone is insufficient.
+class AppleVerifiedQueueTransaction {
+  const AppleVerifiedQueueTransaction({
+    required this.observationId,
+    required this.receiptHash,
+    required this.transactionId,
+    required this.appId,
+    required this.environment,
+    required this.productId,
+    required this.scope,
+    required this.orderId,
+    required this.quantity,
+    required this.reference,
+  });
+  final String observationId, receiptHash, transactionId;
+  final String appId, environment, productId, scope, orderId;
+  final int quantity;
+
+  /// Unique verifier reference for this observation.
+  final String reference;
 }
 
 enum AppleObservationState {

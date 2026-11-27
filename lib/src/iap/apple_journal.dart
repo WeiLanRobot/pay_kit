@@ -464,6 +464,11 @@ Future<void> restoreUnprovenAttempts(DatabaseExecutor db,
 const appleEnvironments = {'production', 'sandbox', 'xcode'};
 
 const _recoverySchema = [
+  '''CREATE TABLE IF NOT EXISTS recovery.verified_queue_transaction(
+       observation TEXT PRIMARY KEY, appId TEXT NOT NULL, reference TEXT NOT NULL,
+       receiptHash TEXT NOT NULL, environment TEXT NOT NULL, transactionId TEXT NOT NULL,
+       productId TEXT NOT NULL, scope TEXT NOT NULL, orderId TEXT NOT NULL,
+       UNIQUE(appId,reference))''',
   '''CREATE TABLE IF NOT EXISTS recovery.finish_authority(
        generation TEXT NOT NULL, objectKey TEXT NOT NULL, itemId TEXT NOT NULL,
        environment TEXT NOT NULL, basis TEXT NOT NULL,

@@ -140,6 +140,10 @@ final snapshot = await account.buy(
 
 若要在重装后为某项补收尾，可以通过 `originalSubmission` 传入宿主已认证的 `AppleOriginalSubmission`。服务端须在购买前为这一次提交独占登记 UUID，并核实购买时 Apple 交易与原始 UUID、环境、商品及数量的对应关系。仅有事后设置的 token 或覆盖多笔交易的 App 收据时，可以提交已核实的最终处置，等待对象来源得到证明。
 
+旧版普通字符串订单没有购前 UUID，且商品在当前消耗品目录内时，宿主可从 `unmatched()` 返回的 `currentObservationIds` 选取当前观察 ID，将 `observations[id]` 中的候选收据交给自己的验单服务。收据暂缺时可按需调用 `refreshReceipts()`，再读取候选收据。服务端须验证 Apple 收据的签名、应用和真实环境，从中定位交易号与当前设备报告号完全相同、商品一致、数量为 1 的消耗品付款，并通过已有订单记录确认账号、原订单及最终履约结果。仅查到同商品或已发货，不足以签发证明。服务端为该观察出具唯一引用，并返回 `AppleVerifiedQueueTransaction` 所需字段；`receiptHash` 是对送验的原始 Base64 收据字符串按 UTF-8 计算的 SHA-256 小写十六进制摘要。
+
+宿主用这份已认证的回复调用 `recoverObservation(claim, verifiedQueueTransaction: proof)`，将普通业务订单号放入 `orderId`，`purchaseToken` 留空。可随调用提交最终处置，或复用已入账的发货或退款回执。苹果重播产生新的观察时，应对新观察重新送验，按同一笔苹果交易复用履约结果。设备号和验单交易号不同、来源冲突或没有独立订单记录时，使用原有对账流程保留待核对状态。
+
 若交易有相互冲突的认领或处置，`unmatched()` 会给出争议引用、当前修订号和回执引用。应用级服务将已认证的 `AppleDisputeReview` 传给 `AppleClaim` 的 `review` 参数。复核须指向当前争议；涉及已发货订单的补偿时，还须核对原履约回执。托管验单超时或切换账号后可能重试同一笔付款，服务端必须按应用、真实商店环境和核实的交易号原子去重。`AppleAttemptDecision` 须绑定环境；旧业务订单串缺失时，已付款裁决还须有能独立关联原提交的依据。
 
 正式复核可以选择已在争议中留证的正确 Apple 交易号。跨环境复核时，`AppleTransaction.environmentProofs` 提供可选证明，`AppleDisputeReview.environmentProofId` 选择实际环境。已有发货时，宿主须先完成补偿并提交覆盖原回执的已退款处置。在目标环境重新提供归属和处置依据后，SDK 才能结束该环境的队列项。更正涉及已有独立扣款或无法区分的多个报告号时，SDK 保留争议。

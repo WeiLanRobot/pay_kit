@@ -851,13 +851,15 @@ class ApplePayments {
 
   /// Authenticated application-level recovery of exactly one saved observation.
   Future<AppleRecoveryResult> recoverObservation(AppleClaim claim,
-      {AppleOriginalSubmission? originalSubmission}) async {
+      {AppleOriginalSubmission? originalSubmission,
+      AppleVerifiedQueueTransaction? verifiedQueueTransaction}) async {
     if (_configuration == null) {
       throw StateError('Application identity required');
     }
     await _configuration;
     if (!_ready || _closed) throw StateError('Application identity required');
-    return _recoverObservation(claim, originalSubmission);
+    return _recoverObservation(
+        claim, originalSubmission, verifiedQueueTransaction);
   }
 
   Future<void> reconcile(AppleClaim claim) async {

@@ -341,6 +341,8 @@ extension _AppleEnvironment on ApplePayments {
           receipts: List.unmodifiable(
               observations.values.expand((values) => values).toSet()),
           observations: Map.unmodifiable(observations),
+          currentObservationIds: Set.unmodifiable(
+              observations.keys.where(_currentUnbound.containsKey)),
           reason: r['reason'] as String?));
     }
     return result;
@@ -712,9 +714,13 @@ extension _AppleEnvironment on ApplePayments {
       var key = await _queueKey(db, e);
       var prior = await _row(db, 'queue_item', key);
       var queueId = r['queueId'];
-      if (prior?['finished'] == 1 && prior?['observation'] != id) {
-        // This handle is live now. A completed row keyed by the same device
-        // report cannot attest removal of the newly authorized native object.
+      final priorEvent = _live[key] ?? _currentUnbound[prior?['observation']];
+      if (prior != null &&
+          prior['observation'] != id &&
+          (prior['finished'] == 1 ||
+              priorEvent != null && _objectKey(priorEvent) != _objectKey(e))) {
+        // A different live object retains its own authorization. A completed
+        // row also cannot attest removal of this newly authorized handle.
         key = 'replay/$id';
         queueId = null;
         prior = await _row(db, 'queue_item', key);

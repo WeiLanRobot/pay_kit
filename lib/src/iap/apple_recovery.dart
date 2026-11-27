@@ -125,10 +125,131 @@ extension _AppleRecovery on ApplePayments {
         .isNotEmpty;
   }
 
+  bool _onlyLiveQueueObject(StoreEvent event) {
+    return !_live.values.followedBy(_currentUnbound.values).any((other) =>
+        (other.transactionId == event.transactionId ||
+            other.queueId == event.queueId) &&
+        _objectKey(other) != _objectKey(event));
+  }
+
+  Future<void> _acceptVerifiedQueueTransaction(
+      DatabaseExecutor db,
+      AppleClaim c,
+      _Row r,
+      _Row? purchase,
+      AppleVerifiedQueueTransaction proof) async {
+    final id = proof.observationId;
+    if (id != r['id'] ||
+        proof.transactionId != c.reportedTransactionId ||
+        proof.transactionId != c.verifiedTransactionId ||
+        proof.appId != c.appId ||
+        proof.environment != c.environment ||
+        proof.productId != c.productId ||
+        proof.scope != c.scope ||
+        proof.orderId != c.orderId ||
+        proof.quantity != 1 ||
+        proof.reference.trim().isEmpty ||
+        c.purchaseToken != null ||
+        c.review != null ||
+        _disagrees(r['token'], c.orderId) ||
+        Uuid.isValidUUID(fromString: r['token'] as String? ?? '') ||
+        _chargeOnHold(purchase) ||
+        _disagrees(purchase?['scope'], c.scope) ||
+        _disagrees(purchase?['orderId'], c.orderId) ||
+        _disagrees(purchase?['productId'], c.productId) ||
+        c.disposition == null &&
+            !const {'delivered', 'refunded'}
+                .contains(purchase?['disposition'])) {
+      throw StateError('Verified Apple transaction does not match the order');
+    }
+    final record = {
+      'observation': id,
+      'appId': c.appId,
+      'reference': proof.reference,
+      'receiptHash': proof.receiptHash,
+      'environment': c.environment,
+      'transactionId': proof.transactionId,
+      'productId': c.productId,
+      'scope': c.scope,
+      'orderId': c.orderId,
+    };
+    final prior = await db.query('recovery.verified_queue_transaction',
+        where: 'observation=? OR (appId=? AND reference=?)',
+        whereArgs: [id, c.appId, proof.reference]);
+    if (prior.isNotEmpty &&
+        (prior.length != 1 ||
+            !record.entries.every((e) => prior.single[e.key] == e.value))) {
+      throw StateError('Apple observation proof already used');
+    }
+    if (r['reason'] != 'sourceUnproven') {
+      throw StateError(
+          'Apple observation requires existing dispute resolution');
+    }
+    if (prior.isNotEmpty && r['finished'] == 1) return;
+    final event = _currentUnbound[id];
+    if (event == null ||
+        r['generation'] != _generation ||
+        event.native == null ||
+        _objectKey(event) != r['objectKey'] ||
+        event.status != StoreStatus.paid ||
+        !event.allowsUnownedFinish ||
+        event.productId != c.productId ||
+        event.originalTransactionId != null ||
+        event.queueId != proof.transactionId ||
+        event.transactionId != proof.transactionId ||
+        !_onlyLiveQueueObject(event)) {
+      throw StateError(
+          'Verified Apple transaction requires its current queue object');
+    }
+    final candidate = await db.rawQuery(
+        'SELECT 1 FROM recovery.candidate WHERE observation=? AND hash=? LIMIT 1',
+        [id, proof.receiptHash]);
+    if (candidate.isEmpty) {
+      throw StateError('Verified receipt does not belong to this observation');
+    }
+    if (await _legacyQueueHistoryConflicts(
+        db, c.orderId, c.productId, c.environment, proof.transactionId)) {
+      throw StateError('Conflicting Apple transaction source');
+    }
+    if (prior.isEmpty) {
+      await db.insert('recovery.verified_queue_transaction', record);
+    }
+  }
+
+  Future<bool> _legacyQueueHistoryConflicts(DatabaseExecutor db, String order,
+      String product, String environment, String transaction) async {
+    // Keep the legacy exception out of registered submissions and disputed
+    // histories, even when the selected observation by itself looks consistent.
+    final conflict =
+        await db.rawQuery('''SELECT 1 FROM recovery.submission WHERE token=?
+      UNION ALL SELECT 1 FROM recovery.observation WHERE (reportedId=? OR queueId=?)
+      AND (status NOT IN ('pending','paid') OR originalId IS NOT NULL
+        OR reportedId!=? OR queueId!=? OR productId!=? OR token!=?
+        OR actual!=? OR boundEnvironment!=? OR verifiedId!=?
+        OR reason IN ('identityConflict','environmentConflict','environmentRejected',
+          'originalSubmissionConflict','compatibilityTransferred'))
+      LIMIT 1''', [
+      order,
+      transaction,
+      transaction,
+      transaction,
+      transaction,
+      product,
+      order,
+      environment,
+      environment,
+      transaction
+    ]);
+    return conflict.isNotEmpty;
+  }
+
   Future<AppleRecoveryResult> _recoverObservation(
-      AppleClaim c, AppleOriginalSubmission? original) async {
+      AppleClaim c,
+      AppleOriginalSubmission? original,
+      AppleVerifiedQueueTransaction? queueProof) async {
     final id = c.observationId;
     if (!_validClaim(c) ||
+        original != null && queueProof != null ||
         id == null ||
         id.trim().isEmpty ||
         c.disposition != null && !_matchesClaim(c, c.disposition!)) {
@@ -181,7 +302,11 @@ extension _AppleRecovery on ApplePayments {
         }
         purchase = reviewed;
       }
-      final proven = await _sourceForObservation(db, c, r);
+      if (queueProof != null) {
+        await _acceptVerifiedQueueTransaction(db, c, r, purchase, queueProof);
+      }
+      final proven =
+          queueProof != null || await _sourceForObservation(db, c, r);
       if (proven) {
         final byReport = await _reportedPurchase(db, c.reportedTransactionId);
         if (byReport != null &&

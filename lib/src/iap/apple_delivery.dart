@@ -835,6 +835,7 @@ extension _AppleDelivery on ApplePayments {
 
   Future<void> _finishRecorded(String key, StoreEvent e, String? id) async {
     String? observation;
+    var requiresExactObject = false;
     final permitted = await _journal.write((db) async {
       final q = await _row(db, 'queue_item', key);
       if (q == null || q['finished'] == 1 || q['status'] != e.status.name) {
@@ -883,12 +884,45 @@ extension _AppleDelivery on ApplePayments {
           AND (id=? OR (generation=? AND objectKey=?)) LIMIT 1""",
           [observation, _generation, _objectKey(e)]);
       if (disputedSource.isNotEmpty) return false;
+      if (observation != null) {
+        final proofs = await db.rawQuery('''SELECT o.generation,o.objectKey,v.*
+          FROM recovery.verified_queue_transaction v JOIN recovery.observation o
+          ON o.id=v.observation WHERE v.observation=?''', [observation]);
+        if (proofs.isNotEmpty) {
+          requiresExactObject = true;
+          final proof = proofs.single;
+          if (proof['generation'] != _generation ||
+              proof['objectKey'] != _objectKey(e) ||
+              proof['appId'] != p['appId'] ||
+              proof['environment'] != _environment ||
+              proof['environment'] != p['environment'] ||
+              proof['transactionId'] != reported ||
+              e.queueId != reported ||
+              e.originalTransactionId != null ||
+              proof['transactionId'] != p['verifiedId'] ||
+              proof['scope'] != p['scope'] ||
+              proof['orderId'] != p['orderId'] ||
+              proof['productId'] != p['productId'] ||
+              !e.allowsUnownedFinish ||
+              !_onlyLiveQueueObject(e) ||
+              await _legacyQueueHistoryConflicts(db, proof['orderId'] as String,
+                  e.productId, proof['environment'] as String, reported)) {
+            return false;
+          }
+        }
+      }
       await _recordFinishAuthority(db, e,
           itemId: key, purchase: p, handoff: handoff);
       return true;
     });
     final current = _live[key] ?? _currentUnbound[observation];
-    if (!permitted || !_ready || _closed || current == null) return;
+    if (!permitted ||
+        !_ready ||
+        _closed ||
+        current == null ||
+        requiresExactObject && !_onlyLiveQueueObject(current)) {
+      return;
+    }
     if (!_sameFinishObject(current, e)) {
       throw StateError('StoreKit finish observation changed');
     }
