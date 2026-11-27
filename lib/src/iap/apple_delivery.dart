@@ -381,8 +381,8 @@ Future<void> _openDispute(
   if (existing.isNotEmpty) return;
   if (reason == 'environmentConflict') {
     await db.rawUpdate(
-        "UPDATE recovery.observation SET reason=? WHERE originPurchase=? AND reason!='environmentRejected'",
-        [reason, p['id']]);
+        "UPDATE recovery.observation SET reason=? WHERE $_sourcePurchases AND reason!='environmentRejected'",
+        [reason, p['id'], p['id']]);
   }
   await _conflict(db, p, null, reason, evidence);
   await db.rawUpdate(
@@ -505,6 +505,8 @@ extension _AppleDelivery on ApplePayments {
           !_disagrees(fromQueue['token'], token) &&
           !_disagrees(fromQueue['originalId'], e.originalTransactionId) &&
           !_disagrees(fromQueue['attemptId'], a?['id']) &&
+          !await _sourceBlocksBinding(db, fromQueue) &&
+          !await _sourceBlocksBinding(db, fromId) &&
           await _canJoinQueueObservation(
               db, fromQueue, fromId, queue!['id'] as String);
       if (canJoin) p = fromId;
@@ -1594,13 +1596,16 @@ extension _AppleDelivery on ApplePayments {
                     limit: 1))
                 .firstOrNull ??
             p;
+        final sourceBlocked = await _sourceBlocksBinding(db, p) ||
+            p['id'] != canonical['id'] &&
+                await _sourceBlocksBinding(db, canonical);
         if (p['scope'] != ack.scope ||
             p['orderId'] != ack.orderId ||
             canonical['scope'] != ack.scope ||
             canonical['orderId'] != ack.orderId ||
             input.scope != ack.scope ||
             input.orderId != ack.orderId ||
-            _requiresEnvironmentProof(p['reason'])) {
+            sourceBlocked) {
           final fresh = await _saveDisposition(db, canonical, ack);
           if (fresh) {
             final reason = _requiresEnvironmentProof(p['reason'])
@@ -1904,14 +1909,9 @@ extension _AppleDelivery on ApplePayments {
       return _reviewDispute(db, canonical, p, c, affected,
           exactObservation: exactObservation);
     }
-    if (const {'environmentMismatch', 'environmentConflict'}
-            .contains(canonical['reason']) ||
-        await _hasForeignSource(db, canonical['id'] as String) ||
-        canonical['reason'] == 'sourceUnproven' &&
-            !await _provesSource(db, canonical, c) ||
-        (canonical['conflict'] == 1 &&
-            (await _disputedEnvironmentProofs(db, canonical['id'] as String))
-                .isNotEmpty)) {
+    if (await _sourceBlocksBinding(db, p, claim: c) ||
+        canonical['id'] != p['id'] &&
+            await _sourceBlocksBinding(db, canonical, claim: c)) {
       throw StateError(
           'Apple source environment requires independent verification');
     }
@@ -2107,6 +2107,7 @@ extension _AppleDelivery on ApplePayments {
       LIMIT 1''',
         [from, to, from, from, claim.reportedTransactionId, from, from]);
     if (protected.isNotEmpty ||
+        await _sourceBlocksBinding(db, source, claim: claim) ||
         source['verifiedId'] != null ||
         source['disposition'] != null ||
         source['reportedId'] != claim.reportedTransactionId ||
@@ -2282,8 +2283,8 @@ extension _AppleDelivery on ApplePayments {
     if (proofs.isNotEmpty) {
       await db.rawUpdate("""UPDATE recovery.observation SET reason=
         CASE WHEN id=? THEN 'environmentSelected' ELSE 'environmentRejected' END
-        WHERE originPurchase=? AND observedContext=? AND reason='environmentConflict'""",
-          [r.environmentProofId, id, _environment]);
+        WHERE $_sourcePurchases AND observedContext=? AND reason='environmentConflict'""",
+          [r.environmentProofId, id, id, _environment]);
     }
     // The compatibility snapshot retains its original receipt and queue identity.
     // Its effective environment reservation must follow the adjudication.

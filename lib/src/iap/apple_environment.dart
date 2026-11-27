@@ -1,5 +1,10 @@
 part of 'apple_payments.dart';
 
+// Old ledgers can retain the original purchase ID on a signed source proof
+// even after its queue items and evidence moved to a canonical charge.
+const _sourcePurchases =
+    'originPurchase IN (SELECT ? UNION ALL SELECT id FROM purchase_redirect WHERE purchaseId=?)';
+
 extension _AppleEnvironment on ApplePayments {
   String _objectKey(StoreEvent e) =>
       _handleKey(e) ??
@@ -302,16 +307,16 @@ extension _AppleEnvironment on ApplePayments {
   Future<bool> _hasForeignSource(
           DatabaseExecutor db, String purchaseId) async =>
       (await db.rawQuery('''SELECT 1 FROM recovery.observation WHERE
-        originPurchase=? AND observedContext=? AND actual!=observedContext
+        $_sourcePurchases AND observedContext=? AND actual!=observedContext
         AND originLinked=1 AND reason IN ('environmentMismatch','environmentSelected')
-        LIMIT 1''', [purchaseId, _environment])).isNotEmpty;
+        LIMIT 1''', [purchaseId, purchaseId, _environment])).isNotEmpty;
 
   Future<Map<String, AppleEnvironmentMismatch>> _disputedEnvironmentProofs(
       DatabaseExecutor db, String purchaseId) async {
     final rows = await db.rawQuery(
         """SELECT id,proof FROM recovery.observation WHERE
-      originPurchase=? AND observedContext=? AND originLinked=1 AND reason='environmentConflict'""",
-        [purchaseId, _environment]);
+      $_sourcePurchases AND observedContext=? AND originLinked=1 AND reason='environmentConflict'""",
+        [purchaseId, purchaseId, _environment]);
     return Map.unmodifiable({
       for (final row in rows)
         row['id'] as String: _decodeEnvironmentProof(row['proof'] as String)
@@ -526,6 +531,18 @@ extension _AppleEnvironment on ApplePayments {
         attempt['orderId'] == c.orderId &&
         attempt['productId'] == c.productId &&
         !_disagrees(attempt['scope'], c.scope);
+  }
+
+  Future<bool> _sourceBlocksBinding(DatabaseExecutor db, _Row p,
+      {AppleClaim? claim}) async {
+    final id = p['id'] as String;
+    return p['reason'] == 'environmentMismatch' ||
+        p['reason'] == 'environmentConflict' ||
+        p['reason'] == 'sourceUnproven' &&
+            (claim == null || !await _provesSource(db, p, claim)) ||
+        await _hasForeignSource(db, id) ||
+        p['conflict'] == 1 &&
+            (await _disputedEnvironmentProofs(db, id)).isNotEmpty;
   }
 
   Future<bool> _bindObservation(DatabaseExecutor db, AppleClaim c,
@@ -892,9 +909,14 @@ extension _AppleEnvironment on ApplePayments {
           'UPDATE recovery.observation SET originPurchase=? WHERE id=?',
           [canonical, ref]);
       final different = await db.rawQuery(
-          '''SELECT 1 FROM recovery.observation WHERE originPurchase=? AND
+          '''SELECT 1 FROM recovery.observation WHERE $_sourcePurchases AND
           (actual!=? OR verifiedId!=?) LIMIT 1''',
-          [canonical, proof.actualEnvironment, proof.verifiedTransactionId]);
+          [
+            canonical,
+            canonical,
+            proof.actualEnvironment,
+            proof.verifiedTransactionId
+          ]);
       if (p['disposition'] != null ||
           p['verifiedId'] != null ||
           different.isNotEmpty) {

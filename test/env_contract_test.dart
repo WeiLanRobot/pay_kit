@@ -532,6 +532,41 @@ void main() {
     expect((await a.buy(productId: 'sku', orderId: 'source')).attemptId, token);
     expect(store.submitted, [token]);
     expect(store.finished, isEmpty);
+    // An independent financial row in the source partition cannot acquire
+    // the native object whose signed proof selected a different environment.
+    final otherCharge = AppleClaim(
+      appId: 'app',
+      environment: 'production',
+      scope: 'A',
+      orderId: 'source',
+      productId: 'sku',
+      reportedTransactionId: 'T',
+      verifiedTransactionId: 'T',
+      purchaseToken: token,
+      reference: 'local-financial-evidence',
+      disposition: const AppleDisposition(
+        appId: 'app',
+        environment: 'production',
+        scope: 'A',
+        orderId: 'source',
+        productId: 'sku',
+        reportedTransactionId: 'T',
+        verifiedTransactionId: 'T',
+        reference: 'separate-local-delivery',
+      ),
+    );
+    await pay.recordPayment(otherCharge);
+    await expectLater(pay.reconcile(otherCharge), throwsStateError);
+    await pay.retryPending();
+    await pay.settle();
+    expect(store.finished, isEmpty);
+    expect(
+        (await a.lookup('source'))!
+            .charges
+            .where((c) => c.reference == 'separate-local-delivery')
+            .single
+            .transactionId,
+        isNull);
     await stop();
     await create();
     store.cold.add(item('target', StoreStatus.paid, tx: 'T', token: token));
@@ -556,6 +591,35 @@ void main() {
     expect(credits, 1);
     expect(store.submitted, isEmpty);
     expect(store.finished.map((e) => e.native), ['target']);
+  });
+
+  test(
+      'an unlinked mismatch still needs original submission evidence before merging',
+      () async {
+    await pay.start(environment: 'sandbox');
+    final a = pay.connect(
+        scope: 'A',
+        verify: (_) async => const AppleVerification.environmentMismatch(
+            AppleEnvironmentMismatch(
+                appId: 'app',
+                expectedEnvironment: 'sandbox',
+                actualEnvironment: 'production',
+                reportedTransactionId: 'T',
+                verifiedTransactionId: 'T',
+                productId: 'sku',
+                issuer: 'server',
+                reference: 'without-submission')));
+    final token = (await a.buy(productId: 'sku', orderId: 'O')).attemptId!;
+    store.stream
+        .add([item('pending-source', StoreStatus.paid, tx: 'T', token: token)]);
+    await pay.settle();
+    expect((await a.lookup('O'))!.charges.single.reason, 'sourceUnproven');
+    final withoutToken = claim('sandbox', 'O', null);
+    await pay.recordPayment(withoutToken);
+    await expectLater(pay.reconcile(withoutToken), throwsStateError);
+    expect(store.finished, isEmpty);
+    await pay.reconcile(claim('sandbox', 'O', token));
+    expect((await a.lookup('O'))!.charges.single.attemptId, token);
   });
 
   test(
