@@ -11,6 +11,8 @@ export 'src/config/pay_config.dart';
 export 'src/config/default_pay_config.dart';
 export 'src/config/pay_config_holder.dart';
 export 'src/iap/buy_engine.dart';
+export 'src/iap/apple_payments.dart' show ApplePayments, AppleAccount;
+export 'src/iap/apple_models.dart';
 
 typedef PayCallback = void Function(bool success, int code, String message);
 

@@ -1,0 +1,42 @@
+{
+  "identifier": "E88BC9E6-267D-4D66-9BD7-D4098608CBE4",
+  "nonRenewingSubscriptions": [],
+  "products": [{
+    "displayPrice": "0.99",
+    "familyShareable": false,
+    "internalID": "1270042601",
+    "localizations": [{"description":"StoreKit local test product","displayName":"Coins","locale":"en_US"}],
+    "productID": "test.coins",
+    "referenceName": "Coins",
+    "type": "Consumable"
+  }, {
+    "displayPrice": "1.99",
+    "familyShareable": false,
+    "internalID": "1270042603",
+    "localizations": [{"description":"Permanent unlock","displayName":"Unlock","locale":"en_US"}],
+    "productID": "test.unlock",
+    "referenceName": "Unlock",
+    "type": "NonConsumable"
+  }],
+  "settings": {"_locale":"en_US","_storefront":"USA"},
+  "subscriptionGroups": [{
+    "id": "E98D481A",
+    "localizations": [],
+    "name": "Monthly",
+    "subscriptions": [{
+      "adHocOffers": [],
+      "displayPrice": "2.99",
+      "familyShareable": false,
+      "groupNumber": 1,
+      "internalID": "1270042602",
+      "introductoryOffer": null,
+      "localizations": [{"description":"Monthly subscription","displayName":"Monthly","locale":"en_US"}],
+      "productID": "test.monthly",
+      "referenceName": "Monthly",
+      "recurringSubscriptionPeriod": "P1M",
+      "subscriptionGroupID": "E98D481A",
+      "type": "RecurringSubscription"
+    }]
+  }],
+  "version": {"major":3,"minor":0}
+}

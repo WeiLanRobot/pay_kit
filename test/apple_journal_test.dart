@@ -1,0 +1,389 @@
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:pay_kit/src/iap/apple_journal.dart';
+import 'package:sqflite/sqflite.dart';
+
+void main() {
+  late Directory temp;
+  late File file;
+  late AppleJournal journal;
+
+  setUp(() async {
+    temp = await Directory.systemTemp.createTemp('paykit-sqlite-');
+    file = File('${temp.path}/app/ledger.sqlite');
+    journal = AppleJournal(() async => file);
+  });
+  tearDown(() async {
+    await journal.close();
+    await temp.delete(recursive: true);
+  });
+
+  Future<int> revision() => journal.read((db) async =>
+      (await db.query('meta', columns: ['revision'])).single['revision']
+          as int);
+
+  Future<void> purchase(DatabaseExecutor db, String id) async {
+    await db.insert('purchase', {'id': id, 'productId': 'coffee'});
+  }
+
+  Map<String, Object?> attempt(String id,
+          {String scope = 'A', String order = '42'}) =>
+      {
+        'id': id,
+        'scope': scope,
+        'orderId': order,
+        'productId': 'coffee',
+        'wireToken': id,
+        'mode': 'scoped',
+        'phase': 'prepared',
+      };
+
+  test('the connection owns the ledger between transactions until close',
+      () async {
+    await journal.write((db) => db.insert('attempt', attempt('u1')));
+    final contender = AppleJournal(() async => file);
+    addTearDown(contender.close);
+    await expectLater(
+        contender.write((db) => db.insert('attempt', attempt('u2'))),
+        throwsA(isA<DatabaseException>()));
+    await journal.close();
+    final rows = await contender.read((db) => db.query('attempt'));
+    expect(rows.single['id'], 'u1');
+    await contender.close();
+    expect(await revision(), 1);
+  });
+
+  test(
+      'concurrent writes serialize and only committed facts increment revision',
+      () async {
+    await Future.wait(
+        List.generate(16, (i) => journal.write((db) => purchase(db, 'p$i'))));
+    await expectLater(journal.write((db) async {
+      await purchase(db, 'more');
+      throw StateError('simulate failure before commit');
+    }), throwsStateError);
+    expect(await revision(), 16);
+    await expectLater(journal.read((db) => purchase(db, 'unversioned')),
+        throwsA(isA<DatabaseException>()));
+    await journal.close();
+    final rows = await journal.read((db) => db.query('purchase'));
+    expect(rows.length, 16);
+    expect(await revision(), 16);
+  });
+
+  test('order locks, wire tokens and attempt identities survive terminal facts',
+      () async {
+    const uuid = '075e826b-239a-44f4-9bf0-fdf12f7b67c3';
+    await journal.write(
+        (db) => db.insert('attempt', {...attempt('u1'), 'wireToken': uuid}));
+    await expectLater(
+        journal.write((db) => db.insert('attempt', attempt('u2'))),
+        throwsA(isA<DatabaseException>()));
+    await journal
+        .write((db) => db.insert('attempt', attempt('u3', scope: 'B')));
+    await journal.write((db) => db.update('attempt', {'phase': 'canceled'},
+        where: 'id=?', whereArgs: ['u1']));
+    await journal.close();
+    await journal.write((db) => db.insert('attempt', attempt('u2')));
+    await expectLater(
+        journal.write((db) => db.update('attempt', {'scope': 'C'},
+            where: 'id=?', whereArgs: ['u1'])),
+        throwsA(isA<DatabaseException>()));
+    final legacy = {
+      ...attempt('legacy'),
+      'scope': null,
+      'mode': 'legacy',
+      'wireToken': uuid.toUpperCase()
+    };
+    await expectLater(journal.write((db) => db.insert('attempt', legacy)),
+        throwsA(isA<DatabaseException>()));
+    for (final key in ['Case', 'case']) {
+      await journal.write((db) => db.insert(
+          'attempt', {...legacy, 'id': key, 'wireToken': key, 'orderId': key}));
+    }
+  });
+
+  test('an authenticated original UUID cannot be issued to a new attempt',
+      () async {
+    const token = '423f1231-7c53-480f-b73e-614a2b278c06';
+    final proof = {
+      'appId': 'app',
+      'token': token,
+      'issuer': 'server',
+      'reference': 'registration-1',
+      'environment': 'sandbox',
+      'scope': 'A',
+      'orderId': '1',
+      'productId': 'coffee',
+      'verifiedId': 'V',
+      'reportedId': 'T',
+    };
+    await journal.select('app', 'sandbox');
+    await journal.write((db) async {
+      await db.insert('recovery.original_submission', proof);
+    });
+    await journal.close();
+    await journal.select('app', 'production');
+    await expectLater(
+        journal.write((db) =>
+            reserveAppleToken(db, token.toUpperCase(), 'production', 'new')),
+        throwsStateError);
+    expect(
+        await journal.read((db) => db.query('recovery.submission')), isEmpty);
+  });
+
+  test('the verified Apple identity is unique across local purchases',
+      () async {
+    await journal.write((db) async {
+      await purchase(db, 'p1');
+      await purchase(db, 'p2');
+    });
+    final proof = {
+      'appId': 'store.app',
+      'environment': 'sandbox',
+      'verifiedId': 'T1',
+      'ackRef': 'ack1',
+      'disposition': 'delivered',
+    };
+    await journal.write(
+        (db) => db.update('purchase', proof, where: 'id=?', whereArgs: ['p1']));
+    await expectLater(
+        journal.write((db) =>
+            db.update('purchase', proof, where: 'id=?', whereArgs: ['p2'])),
+        throwsA(isA<DatabaseException>()));
+    await expectLater(
+        journal.write((db) => db.update('purchase', {'verifiedId': 'T2'},
+            where: 'id=?', whereArgs: ['p1'])),
+        throwsA(isA<DatabaseException>()));
+    final rows =
+        await journal.read((db) => db.query('purchase', orderBy: 'id'));
+    expect(rows.map((p) => p['ackRef']), ['ack1', null]);
+  });
+
+  test('receipt bodies survive restart and are collected at last reference',
+      () async {
+    await journal.write((db) async {
+      for (final id in ['p1', 'p2']) {
+        await purchase(db, id);
+      }
+      for (final hash in ['shared', 'first-only']) {
+        await db.insert('evidence', {'hash': hash, 'body': 'signed-$hash'});
+      }
+      for (final ids in [
+        ['p1', 'shared'],
+        ['p1', 'first-only'],
+        ['p2', 'shared']
+      ]) {
+        await db.insert(
+            'purchase_evidence', {'purchaseId': ids.first, 'hash': ids.last});
+      }
+    });
+    await journal.close();
+    expect(
+        (await journal.read((db) => db.query('purchase_evidence'))).length, 3);
+    await journal.write((db) => db
+        .delete('purchase_evidence', where: 'purchaseId=?', whereArgs: ['p1']));
+    final retained = await journal.read((db) => db.query('evidence'));
+    expect(retained.single['body'], 'signed-shared');
+    await journal.write((db) => db.delete('purchase_evidence'));
+    expect(await journal.read((db) => db.query('evidence')), isEmpty);
+    expect((await journal.read((db) => db.query('purchase'))).length, 2);
+  });
+
+  test('an interrupted compatibility partition can be selected after restart',
+      () async {
+    await journal.select('app', 'production');
+    await journal.write((db) => purchase(db, 'paid'));
+    await journal.close();
+    await File('${file.path}.compat').create();
+
+    for (var restart = 0; restart < 2; restart++) {
+      await journal.select('app', 'production');
+      expect((await journal.read((db) => db.query('purchase'))).single['id'],
+          'paid');
+      await journal.close();
+    }
+    await journal.select(null, null);
+    expect(await journal.read((db) => db.query('purchase')), isEmpty);
+    await journal.write((db) => purchase(db, 'legacy'));
+    await journal.close();
+    await journal.select(null, null);
+    expect((await journal.read((db) => db.query('purchase'))).single['id'],
+        'legacy');
+  });
+
+  test('v5 partitions preserve pending charges and migrate atomically to v6',
+      () async {
+    // Save a paid, unconfirmed queue item in each environment; recreate the v5
+    // schema rather than just changing user_version on a current database.
+    for (final env in ['sandbox', 'production']) {
+      await journal.select('app', env);
+      await journal.write((db) async {
+        await purchase(db, env);
+        await db.insert('queue_item', {
+          'id': 'queue-$env',
+          'purchaseId': env,
+          'status': 'paid',
+          'productId': 'coffee',
+        });
+      });
+    }
+    await journal.close();
+    for (final path in [file.path, '${file.path}.production']) {
+      final old = await openDatabase(path);
+      await old.transaction((db) async {
+        await db.execute('DROP TRIGGER reset_timeout_cursor');
+        await db.execute('ALTER TABLE purchase DROP COLUMN lastTimeoutSeq');
+        await db.execute('PRAGMA user_version=5');
+      });
+      await old.close();
+    }
+    final recovery = await openDatabase('${file.path}.observations');
+    await recovery.execute('DROP TABLE observation_review');
+    await recovery.execute('DROP TABLE original_submission');
+    await recovery.close();
+
+    // Force the identity check to fail before the schema transaction commits.
+    final bad = await openDatabase(file.path);
+    await bad.update('meta', {'revision': 7, 'appId': ' '});
+    await bad.close();
+    await expectLater(journal.select('app', 'sandbox'), throwsStateError);
+    final uncommitted = await openDatabase('${file.path}.observations');
+    expect(
+        await uncommitted.rawQuery(
+            "SELECT name FROM sqlite_master WHERE name IN ('original_submission','observation_review')"),
+        isEmpty);
+    await uncommitted.close();
+    final repair = await openDatabase(file.path);
+    expect(await repair.getVersion(), 5);
+    expect(
+        (await repair.rawQuery('PRAGMA table_info(purchase)'))
+            .map((c) => c['name']),
+        isNot(contains('lastTimeoutSeq')));
+    await repair.update('meta', {'appId': 'app'});
+    await repair.close();
+
+    for (final env in ['production', 'sandbox', 'production']) {
+      await journal.select('app', env);
+      await journal.read((db) async {
+        expect(
+            (await db.rawQuery('PRAGMA user_version')).single.values.single, 6);
+        final charge = (await db.query('purchase')).single;
+        expect(charge['id'], env);
+        expect(charge['lastTimeoutSeq'], isNull);
+        expect((await db.query('queue_item')).single['finished'], 0);
+        expect(await db.query('recovery.original_submission'), isEmpty);
+        expect(await db.query('recovery.observation_review'), isEmpty);
+      });
+      await journal.close();
+    }
+  });
+
+  test('a v6 ledger detects a mismatched recovery file during startup',
+      () async {
+    await journal.select('app', 'sandbox');
+    await journal.write((db) => purchase(db, 'paid'));
+    await journal.close();
+    final sidecar = await openDatabase('${file.path}.observations');
+    await sidecar.execute('DROP TABLE observation_review');
+    await sidecar.close();
+
+    await expectLater(
+        journal.select('app', 'sandbox'),
+        throwsA(isA<StateError>().having(
+            (e) => e.message, 'message', 'Incomplete Apple recovery ledger')));
+    final main = await openDatabase(file.path);
+    expect((await main.query('purchase')).single['id'], 'paid');
+    await main.close();
+  });
+
+  test('an empty partition cannot hide an unversioned empty table', () async {
+    await journal.select('app', 'production');
+    await journal.close();
+    await File('${file.path}.compat').create();
+    final path = '${file.path}.sandbox';
+    final other = await openDatabase(path);
+    await other.execute('CREATE TABLE prior(id TEXT)');
+    await other.close();
+
+    await expectLater(journal.select('app', 'production'), throwsStateError);
+    final check = await openDatabase(path);
+    try {
+      expect(await check.getVersion(), 0);
+      expect(await check.query('prior'), isEmpty);
+    } finally {
+      await check.close();
+    }
+  });
+
+  test('a previously indexed partition cannot restart as an empty file',
+      () async {
+    await journal.select(null, null);
+    await journal.write((db) => purchase(db, 'legacy'));
+    await journal.select('app', 'production');
+    await journal.close();
+    await File('${file.path}.compat').writeAsBytes([]);
+
+    await expectLater(journal.select('app', 'production'), throwsStateError);
+  });
+
+  test('an empty schema cannot hide a damaged partition', () async {
+    await journal.select('app', 'production');
+    await journal.close();
+    final compat = File('${file.path}.compat');
+    final db = await openDatabase(compat.path);
+    await db.execute('VACUUM');
+    await db.close();
+    final bytes = await compat.readAsBytes();
+    // The SQLite header counts freelist pages at bytes 36–39. This file has none.
+    bytes[39] = 1;
+    await compat.writeAsBytes(bytes);
+
+    await expectLater(journal.select('app', 'production'), throwsStateError);
+    expect(await compat.readAsBytes(), bytes);
+  });
+
+  test('corruption and newer versions fail closed without replacing data',
+      () async {
+    await file.parent.create(recursive: true);
+    final corrupt = List.filled(120, 0x61);
+    await file.writeAsBytes(corrupt);
+    await expectLater(revision(), throwsA(isA<DatabaseException>()));
+    expect(await file.readAsBytes(), corrupt);
+    await file.delete();
+    await journal.write((db) => purchase(db, 'v1'));
+    await journal.close();
+    final futureDb = await openDatabase(file.path);
+    await futureDb.setVersion(42);
+    await futureDb.close();
+    await expectLater(revision(), throwsStateError);
+    final check = await openDatabase(file.path);
+    expect(await check.getVersion(), 42);
+    expect((await check.query('purchase')).single['id'], 'v1');
+    await check.close();
+  });
+
+  test('a full SQLite file rolls back evidence and can resume after restart',
+      () async {
+    await journal.write((db) async {
+      await purchase(db, 'waiting');
+      final capacity =
+          (await db.rawQuery('PRAGMA page_count')).single.values.single;
+      await db.rawQuery('PRAGMA max_page_count = $capacity');
+    });
+    await expectLater(journal.write((db) async {
+      await db.update('purchase', {'reason': 'before overflow'});
+      await db.execute(
+          "INSERT INTO evidence(hash,body) VALUES ('large', zeroblob(1048576))");
+    }), throwsA(isA<DatabaseException>()));
+    await journal.close();
+    expect(await revision(), 1);
+    expect(await journal.read((db) => db.query('evidence')), isEmpty);
+    expect((await journal.read((db) => db.query('purchase'))).single['reason'],
+        isNull);
+    await journal.write(
+        (db) => db.insert('evidence', {'hash': 'small', 'body': 'replayed'}));
+    expect(await revision(), 2);
+  });
+}
