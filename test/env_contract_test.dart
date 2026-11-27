@@ -261,21 +261,33 @@ void main() {
     expect(store.registrations, 0);
   });
 
-  test('legacy callback can request managed startup and retry after handoff',
+  test('new purchases retry managed startup after a legacy receipt handoff',
       () async {
-    final owner = Object();
-    var reentrantRejected = false;
+    final owner = Object(), nextPage = Object();
+    pay.attachLegacy(nextPage, (_) async {}, (_, __) {}, (_) {});
+    final handoffStarted = Completer<void>(), release = Completer<void>();
     pay.attachLegacy(owner, (receipt) async {
       await expectLater(pay.start(environment: 'sandbox'), throwsStateError);
-      reentrantRejected = true;
+      handoffStarted.complete();
+      await release.future;
     }, (_, __) {}, (error) {});
     await pay.buyLegacy(owner, 'sku', 'legacy-first');
     store.stream.add(
         [item('legacy', StoreStatus.paid, token: 'legacy-first', tx: 'T')]);
+    try {
+      await handoffStarted.future.timeout(const Duration(seconds: 4));
+      await expectLater(
+          pay.buyLegacy(nextPage, 'sku', 'new-order'), throwsStateError);
+      expect(store.submitted, ['legacy-first']);
+    } finally {
+      release.complete();
+    }
     await pay.settle();
-    expect(reentrantRejected, isTrue);
     expect(store.finished.map((e) => e.native), ['legacy']);
-    await pay.start(environment: 'sandbox');
+    await pay.buyLegacy(nextPage, 'sku', 'new-order');
+    expect(store.submitted, ['legacy-first', 'new-order']);
+    expect((await journal.read((db) => db.query('meta'))).single['environment'],
+        'sandbox');
     expect(store.registrations, 1);
   });
 

@@ -453,6 +453,13 @@ class ApplePayments {
       if (legacyOwner != null && _legacyBusy[legacyOwner] != null) {
         throw StateError('Previous purchase is being submitted');
       }
+      // Switching journals requires no active launches. Wait before registering
+      // this purchase, then recheck the receiver and any concurrent order.
+      final environment = _requestedEnvironment;
+      if (legacyOwner != null && environment != null && !_configured) {
+        return start(environment: environment).then((_) =>
+            _buy(account, legacyOwner, productId, orderId, suppliedToken));
+      }
       if (legacyOwner != null) _legacyBusy[legacyOwner] = orderId;
 
       final operation = _launch(account, legacyOwner, productId, orderId, token)

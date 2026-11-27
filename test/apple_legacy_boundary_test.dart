@@ -40,9 +40,10 @@ void main() {
   late Completer<void> dismissed;
   late List<String> messages;
 
-  Future<void> start(AppleJournal journal, ReceiptCallback receive) async {
+  Future<void> start(AppleJournal journal, ReceiptCallback receive,
+      {bool legacyOnly = false}) async {
     payments = ApplePayments.forTesting(store, journal);
-    await payments.start(environment: 'sandbox');
+    if (!legacyOnly) await payments.start(environment: 'sandbox');
     dismissed = Completer();
     messages = [];
     PayKit.initialize(DefaultPayConfig(
@@ -69,6 +70,38 @@ void main() {
     await store.stream.close();
     await directory.delete(recursive: true);
     PayKit.initialize(DefaultPayConfig());
+  });
+
+  test('an active legacy page retries the requested environment before buying',
+      () async {
+    final journal = AppleJournal(() async => File('${directory.path}/ledger'));
+    await start(journal, (_) {}, legacyOnly: true);
+    await payments.retryPending();
+    Future<Object?> environment() => journal
+        .read((db) async => (await db.query('meta')).single['environment']);
+    expect(await environment(), isNull);
+
+    store.runningBundle = '';
+    await expectLater(
+        payments.start(environment: 'production'), throwsStateError);
+    page.buyProduct('sku', 'order');
+    await dismissed.future;
+    expect(store.submitted, isEmpty);
+    expect(await journal.read((db) => db.query('attempt')), isEmpty);
+
+    store.runningBundle = 'app';
+    final environmentsAtPurchase = <Object?>[];
+    store.launch = () async {
+      environmentsAtPurchase.add(await environment());
+      return true;
+    };
+    dismissed = Completer();
+    page.buyProduct('sku', 'order');
+    await dismissed.future;
+    expect(environmentsAtPurchase, ['production']);
+    expect(store.submitted, ['order']);
+    expect((await journal.read((db) => db.query('attempt'))).single['orderId'],
+        'order');
   });
 
   test(
