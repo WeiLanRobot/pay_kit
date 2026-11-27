@@ -190,6 +190,7 @@ extension _AppleEnvironment on ApplePayments {
             previous['boundPurchase'] != null &&
             previous['reason'] != 'identityConflict' &&
             previous['reason'] != 'originalSubmissionConflict' &&
+            previous['reason'] != 'queueProofConflict' &&
             _currentUnbound.containsKey(id)) {
           // A fresh native handle can reuse a completed StoreKit report.
           // Its recovered row has a separate key even when the SKU and report
@@ -273,8 +274,13 @@ extension _AppleEnvironment on ApplePayments {
       return;
     }
     if (e.needsFinish) await _store.finish(e);
-    await _rememberRemoval(
-        (key: 'unbound/$id', event: e, purchase: null, unbound: id));
+    await _rememberRemoval((
+      key: 'unbound/$id',
+      event: e,
+      purchase: null,
+      unbound: id,
+      exact: true
+    ));
   }
 
   AppleEnvironmentMismatch _decodeEnvironmentProof(String payload) {
@@ -290,6 +296,15 @@ extension _AppleEnvironment on ApplePayments {
         productId: proof[7] as String,
         purchaseToken: proof[8] as String?);
   }
+
+  // A financial dispute may temporarily replace purchase.reason. Its
+  // resolution does not revise the signed source for this queue partition.
+  Future<bool> _hasForeignSource(
+          DatabaseExecutor db, String purchaseId) async =>
+      (await db.rawQuery('''SELECT 1 FROM recovery.observation WHERE
+        originPurchase=? AND observedContext=? AND actual!=observedContext
+        AND originLinked=1 AND reason IN ('environmentMismatch','environmentSelected')
+        LIMIT 1''', [purchaseId, _environment])).isNotEmpty;
 
   Future<Map<String, AppleEnvironmentMismatch>> _disputedEnvironmentProofs(
       DatabaseExecutor db, String purchaseId) async {
@@ -341,8 +356,11 @@ extension _AppleEnvironment on ApplePayments {
           receipts: List.unmodifiable(
               observations.values.expand((values) => values).toSet()),
           observations: Map.unmodifiable(observations),
-          currentObservationIds: Set.unmodifiable(
-              observations.keys.where(_currentUnbound.containsKey)),
+          currentObservationIds: Set.unmodifiable(observations.keys.where((id) {
+            final event = _currentUnbound[id];
+            return event != null &&
+                !_removingHandles.contains(_handleKey(event));
+          })),
           reason: r['reason'] as String?));
     }
     return result;
@@ -384,14 +402,16 @@ extension _AppleEnvironment on ApplePayments {
     return imported;
   }
 
-  Future<List<_Row>> _claimObservations(
+  Future<({List<_Row> proven, bool financialOnly})> _claimObservations(
       DatabaseExecutor db, AppleClaim c) async {
     final rows = await db.rawQuery(
         """SELECT observation.*, EXISTS(SELECT 1 FROM recovery.observation_review v
         WHERE v.observation=observation.id) AS reviewed FROM recovery.observation WHERE reportedId=?
-      AND productId=? AND status='paid' AND reason NOT IN ('identityConflict','environmentRejected','environmentConflict','compatibilityTransferred')
+      AND productId=? AND status='paid' AND reason NOT IN ('queueProofConflict','identityConflict','environmentRejected','environmentConflict','compatibilityTransferred')
       AND (actual IS NULL OR actual=?) AND (verifiedId IS NULL OR verifiedId=?)
       AND (boundEnvironment IS NULL OR boundEnvironment=?)
+      AND NOT EXISTS(SELECT 1 FROM recovery.verified_queue_transaction v
+        WHERE v.observation=observation.id AND v.environment!=?)
       AND NOT EXISTS(SELECT 1 FROM recovery.submission s WHERE s.token=observation.token
         GROUP BY s.token HAVING count(*)>1)
       AND NOT EXISTS(SELECT 1 FROM recovery.observation legacy
@@ -404,6 +424,7 @@ extension _AppleEnvironment on ApplePayments {
           c.productId,
           c.environment,
           c.verifiedTransactionId,
+          c.environment,
           c.environment,
           c.environment
         ]);
@@ -432,9 +453,9 @@ extension _AppleEnvironment on ApplePayments {
       throw StateError(
           'Apple recovery observation does not match the authenticated claim');
     }
-    if (candidates.isEmpty) return candidates;
-    // Count historical observations before filtering on claimed environment or
-    // token. Resolving one candidate cannot make another's origin self-evident.
+    if (candidates.isEmpty) return (proven: candidates, financialOnly: false);
+    // Preserve the legacy ambiguity signal when several observations fit.
+    // Even a sole observation needs independent source evidence to bind.
     final several = (await db.rawQuery(
             "SELECT 1 FROM recovery.observation WHERE reportedId=? AND productId=? AND status='paid' LIMIT 1 OFFSET 1",
             [c.reportedTransactionId, c.productId]))
@@ -442,14 +463,19 @@ extension _AppleEnvironment on ApplePayments {
     final allowed = <_Row>[];
     for (final r in candidates) {
       if (r['generation'] == 'verified' && r['originLinked'] != 1) continue;
-      if (!several && r['reviewed'] == 0 ||
-          r['generation'] == 'compatibility' ||
+      if (r['generation'] == 'compatibility' ||
           r['generation'] == 'verified' &&
               r['actual'] == c.environment &&
               r['originLinked'] == 1 ||
           await _sourceForObservation(db, c, r)) {
         allowed.add(r);
       }
+    }
+    if (allowed.isEmpty &&
+        !several &&
+        candidates.single['reviewed'] == 0 &&
+        candidates.single['reason'] == 'sourceUnproven') {
+      return (proven: <_Row>[], financialOnly: true);
     }
     if (allowed.isEmpty ||
         c.observationId != null &&
@@ -462,9 +488,9 @@ extension _AppleEnvironment on ApplePayments {
         allowed.where((r) => r['id'] == c.observationId).firstOrNull;
     if (selected == null ||
         selected['generation'] == 'verified' && selected['originLinked'] == 1) {
-      return allowed;
+      return (proven: allowed, financialOnly: false);
     }
-    return [selected];
+    return (proven: [selected], financialOnly: false);
   }
 
   Future<void> _bindExactObservation(
@@ -502,7 +528,7 @@ extension _AppleEnvironment on ApplePayments {
         !_disagrees(attempt['scope'], c.scope);
   }
 
-  Future<void> _bindObservation(DatabaseExecutor db, AppleClaim c,
+  Future<bool> _bindObservation(DatabaseExecutor db, AppleClaim c,
       {_Row? exact}) async {
     final frozen = await db.rawQuery(
         '''SELECT 1 FROM recovery.observation WHERE actual=? AND verifiedId=?
@@ -519,8 +545,10 @@ extension _AppleEnvironment on ApplePayments {
     if (frozen.isNotEmpty) {
       throw StateError('Conflicting Apple environment proof');
     }
-    final candidates =
-        exact == null ? await _claimObservations(db, c) : [exact];
+    final selection = exact == null
+        ? await _claimObservations(db, c)
+        : (proven: [exact], financialOnly: false);
+    final candidates = selection.proven;
     if (candidates.any((row) => row['reason'] == 'environmentSelected')) {
       final existing = (await db.query('purchase',
               where: 'appId=? AND environment=? AND verifiedId=?',
@@ -538,7 +566,7 @@ extension _AppleEnvironment on ApplePayments {
     }
     if (candidates.isEmpty ||
         await _reportedPurchase(db, c.reportedTransactionId) != null) {
-      return;
+      return selection.financialOnly;
     }
     final r = candidates.first;
     await db.insert('purchase', {
@@ -556,6 +584,7 @@ extension _AppleEnvironment on ApplePayments {
       await _addEvidence(db, r['id'] as String, item['body'] as String,
           source: item['source'] as String, context: item['context'] as String);
     }
+    return false;
   }
 
   /// A signed claim can reuse one old receiver's completed handoff. A report
@@ -616,7 +645,7 @@ extension _AppleEnvironment on ApplePayments {
       DatabaseExecutor db, AppleClaim c, String target,
       {_Row? exact}) async {
     final candidates =
-        exact == null ? await _claimObservations(db, c) : [exact];
+        exact == null ? (await _claimObservations(db, c)).proven : [exact];
     await _restoreCompatibilityHandoff(db, c, target);
     final p = (await _row(db, 'purchase', target))!;
     final token = _wire(c.purchaseToken);
@@ -700,16 +729,38 @@ extension _AppleEnvironment on ApplePayments {
                 token
               ]))
               .isNotEmpty;
+      final removed = (await db.rawQuery(
+              'SELECT 1 FROM recovery.removed_object WHERE generation=? AND objectKey=?',
+              [r['generation'], r['objectKey']]))
+          .isNotEmpty;
       await db.update(
           'recovery.observation',
           {
             'boundEnvironment': c.environment,
+            if (removed) 'finished': 1,
             'boundPurchase': target,
             if (external) 'reason': 'originalSubmission',
           },
           where: 'id=?',
           whereArgs: [id]);
       final e = _currentUnbound[id];
+      if (removed) {
+        // This exact object left StoreKit before the claim bound it. Retain
+        // its positive removal alongside the other items for this charge.
+        await db.rawInsert('''INSERT INTO queue_item
+          (id,purchaseId,productId,status,finished,reportedId,observation)
+          SELECT ?,?,?,'paid',1,?,? WHERE NOT EXISTS (
+            SELECT 1 FROM queue_item WHERE observation=?)''', [
+          'replay/$id',
+          target,
+          c.productId,
+          c.reportedTransactionId,
+          id,
+          id
+        ]);
+        await _discardCompletedEvidence(db, target);
+        continue;
+      }
       if (r['generation'] != _generation || e == null) continue;
       var key = await _queueKey(db, e);
       var prior = await _row(db, 'queue_item', key);

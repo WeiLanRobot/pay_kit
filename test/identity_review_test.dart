@@ -173,7 +173,8 @@ void main() {
       final token = await buy();
       await started.future;
       AppleDisposition sourceAck(String ref,
-              {AppleOutcome outcome = AppleOutcome.delivered}) =>
+              {AppleOutcome outcome = AppleOutcome.delivered,
+              String? supersedes}) =>
           AppleDisposition(
               appId: 'app',
               environment: 'production',
@@ -183,13 +184,16 @@ void main() {
               reportedTransactionId: 'T',
               verifiedTransactionId: 'T',
               reference: ref,
-              outcome: outcome);
+              outcome: outcome,
+              supersedes: supersedes);
       AppleClaim source(
-              {AppleDisputeReview? review, AppleDisposition? disposition}) =>
+              {AppleDisputeReview? review,
+              AppleDisposition? disposition,
+              String scope = 'A'}) =>
           AppleClaim(
               appId: 'app',
               environment: 'production',
-              scope: 'A',
+              scope: scope,
               orderId: 'O',
               productId: 'sku',
               reportedTransactionId: 'T',
@@ -238,6 +242,54 @@ void main() {
       await pay.settle();
       expect((await a.lookup('O'))!.charges.single.conflict, false);
       expect(store.finished.length, keepSource ? 1 : 0);
+      if (!keepSource) {
+        final later = source(
+            disposition:
+                sourceAck('another-refund', outcome: AppleOutcome.refunded));
+        await pay.recordPayment(later);
+        await pay.recordPayment(later);
+        await pay.settle();
+        expect((await a.lookup('O'))!.charges.single.reason,
+            'environmentMismatch');
+        expect(store.finished, isEmpty);
+
+        // A pending financial predecessor temporarily takes over the public reason.
+        await pay.recordPayment(source(
+            disposition: sourceAck('additional-refund',
+                outcome: AppleOutcome.refunded,
+                supersedes: 'additional-grant')));
+        expect(
+            (await a.lookup('O'))!.charges.single.reason, 'missingPredecessor');
+        await reopen('production');
+        store.failFinish = false;
+        store.event(token, 'T', queue: 'source replay');
+        await pay
+            .recordPayment(source(disposition: sourceAck('additional-grant')));
+        a = pay.connect(scope: 'A', verify: (r) async => delivered(r));
+        expect((await a.lookup('O'))!.charges.single.reason,
+            'environmentMismatch');
+
+        // A later ownership ruling only resolves that new financial dispute.
+        await pay.recordPayment(source(scope: 'B'));
+        final ownership =
+            (await pay.unmatched()).singleWhere((t) => t.disputeId != null);
+        await pay.recordPayment(source(
+            review: AppleDisputeReview(
+                issuer: 'orders',
+                decisionId: 'later-owner',
+                disputeId: ownership.id,
+                revision: ownership.disputeRevision!,
+                reference: 'confirmed account A',
+                coveredReceipts: ownership.receiptReferences,
+                finalDisposition: sourceAck('final-refund',
+                    outcome: AppleOutcome.refunded))));
+        await expectLater(pay.reconcile(later), throwsStateError);
+        await pay.retryPending();
+        await pay.settle();
+        expect((await a.lookup('O'))!.charges.single.reason,
+            'environmentMismatch');
+        expect(store.finished, isEmpty);
+      }
       await reopen('sandbox');
       store.failFinish = false;
       const destination = 'verified destination';

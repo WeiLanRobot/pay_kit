@@ -156,6 +156,35 @@ void main() {
     await pay.settle();
     await pay.reconcile(claim('sandbox', uuid, uuid));
     await pay.settle();
+    expect(store.finished, isEmpty);
+    final recoveryId = await journal.read((db) async => (await db.query(
+            'recovery.observation',
+            where: 'objectKey=?',
+            whereArgs: ['handle:restore']))
+        .single['id'] as String);
+    final awaiting = await pay.recoverObservation(
+        claim('sandbox', uuid, uuid, observation: recoveryId));
+    expect(awaiting.state, AppleObservationState.awaitingDisposition);
+    await pay.recordPayment(const AppleClaim(
+        appId: 'app',
+        environment: 'sandbox',
+        scope: 'A',
+        orderId: uuid,
+        productId: 'sku',
+        reportedTransactionId: 'T',
+        verifiedTransactionId: 'T',
+        reference: 'original-payment',
+        disposition: AppleDisposition(
+            appId: 'app',
+            environment: 'sandbox',
+            scope: 'A',
+            orderId: uuid,
+            productId: 'sku',
+            reportedTransactionId: 'T',
+            verifiedTransactionId: 'T',
+            outcome: AppleOutcome.delivered,
+            reference: 'server-fulfilled')));
+    await pay.settle();
     expect(store.finished.map((e) => e.native), ['restore']);
     expect(calls, 1);
     expect(store.submitted, isEmpty);

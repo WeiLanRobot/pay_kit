@@ -18,11 +18,13 @@ class StoreEvent {
     this.receipt = '',
     this.queueId,
     this.needsFinish = true,
+    this.removed = false,
     this.allowsUnownedFinish = true,
     this.native,
   });
 
-  factory StoreEvent.fromNative(Map<Object?, Object?> item, String receipt) {
+  factory StoreEvent.fromNative(Map<Object?, Object?> item, String receipt,
+      {bool removed = false}) {
     final handle = item['handle'];
     if (handle is! String || handle.isEmpty) {
       throw const FormatException('Missing StoreKit object handle');
@@ -35,8 +37,9 @@ class StoreEvent {
       transactionId: item['transactionId'] as String?,
       originalTransactionId: item['originalTransactionId'] as String?,
       queueId: item['queueId'] as String?,
-      receipt: status == StoreStatus.paid ? receipt : '',
-      needsFinish: status != StoreStatus.pending,
+      receipt: !removed && status == StoreStatus.paid ? receipt : '',
+      needsFinish: !removed && status != StoreStatus.pending,
+      removed: removed,
       allowsUnownedFinish: item['allowsUnownedFinish'] as bool? ?? true,
       native: handle,
     );
@@ -55,6 +58,9 @@ class StoreEvent {
   final String? queueId;
   final bool needsFinish;
 
+  /// StoreKit observed the removal of this exact native object.
+  final bool removed;
+
   /// Whether the host catalog delegates unowned canceled/failed items for this SKU.
   final bool allowsUnownedFinish;
 
@@ -70,6 +76,7 @@ class StoreEvent {
         queueId: queueId,
         receipt: value,
         needsFinish: needsFinish,
+        removed: removed,
         allowsUnownedFinish: allowsUnownedFinish,
         native: native,
       );
@@ -97,7 +104,7 @@ abstract class AppleStore {
   Stream<List<StoreEvent>> get events;
   Future<void> prepare(String productId);
   Future<bool> purchase(String productId, String token);
-  Future<void> finish(StoreEvent event);
+  Future<void> finish(StoreEvent event, {bool verifiedQueue = false});
   Future<String?> refreshReceipt();
 }
 
@@ -142,10 +149,12 @@ class StoreKitAppleStore implements AppleStore, AppleStoreLifecycle {
     _owner = this;
     try {
       _channel.setMethodCallHandler((call) async {
-        if (call.method != 'updated') throw MissingPluginException();
+        if (call.method != 'updated' && call.method != 'removed') {
+          throw MissingPluginException();
+        }
         final batch = call.arguments as Map;
         if (batch['writer'] == generation && generation == _writer) {
-          _receive(batch);
+          _receive(batch, removed: call.method == 'removed');
         }
       });
       _receive(await _call<Object>('start'));
@@ -177,12 +186,13 @@ class StoreKitAppleStore implements AppleStore, AppleStoreLifecycle {
     if (Platform.isIOS) _receive(await _call<Object>('snapshot'));
   }
 
-  void _receive(Object? message) {
+  void _receive(Object? message, {bool removed = false}) {
     final batch = message as Map;
     final receipt = batch['receipt'] as String;
     final events = [
       for (final item in batch['transactions'] as List)
-        StoreEvent.fromNative(item as Map<Object?, Object?>, receipt),
+        StoreEvent.fromNative(item as Map<Object?, Object?>, receipt,
+            removed: removed),
     ];
     if (events.isNotEmpty) _events.add(events);
   }
@@ -226,7 +236,7 @@ class StoreKitAppleStore implements AppleStore, AppleStoreLifecycle {
   }
 
   @override
-  Future<void> finish(StoreEvent event) async {
+  Future<void> finish(StoreEvent event, {bool verifiedQueue = false}) async {
     if (!event.needsFinish) return;
     final handle = event.native;
     if (handle is! String ||
@@ -237,6 +247,12 @@ class StoreKitAppleStore implements AppleStore, AppleStoreLifecycle {
     final result = await _call<String>('finish', {
       'handle': handle,
       'status': event.status.name,
+      if (verifiedQueue)
+        'verifiedQueue': {
+          'transactionId': event.transactionId,
+          'productId': event.productId,
+          'token': event.token,
+        },
     });
     if (result != 'finished' && result != 'removed') {
       throw StateError('StoreKit could not confirm finish');

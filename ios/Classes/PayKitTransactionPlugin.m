@@ -118,6 +118,21 @@ static NSString *PKReceipt(void) {
   return url ? [[NSData dataWithContentsOfURL:url] base64EncodedStringWithOptions:0] : nil;
 }
 
+- (NSDictionary *)item:(SKPaymentTransaction *)transaction handle:(NSString *)handle {
+  BOOL restored = transaction.transactionState == SKPaymentTransactionStateRestored;
+  SKPaymentTransaction *original = restored ? transaction.originalTransaction : nil;
+  SKPaymentTransaction *purchase = restored ? original : transaction;
+  return @{
+    @"handle": handle, @"status": PKStatus(transaction),
+    @"productId": transaction.payment.productIdentifier,
+    @"allowsUnownedFinish": @(PKCatalogError(transaction.payment.productIdentifier) == nil),
+    @"queueId": transaction.transactionIdentifier ?: NSNull.null,
+    @"originalTransactionId": original.transactionIdentifier ?: NSNull.null,
+    @"transactionId": purchase.transactionIdentifier ?: NSNull.null,
+    @"token": purchase.payment.applicationUsername ?: NSNull.null
+  };
+}
+
 - (NSDictionary *)batch:(NSArray<SKPaymentTransaction *> *)transactions {
   NSMutableArray *items = [NSMutableArray arrayWithCapacity:transactions.count];
   BOOL includeReceipt = NO;
@@ -128,20 +143,9 @@ static NSString *PKReceipt(void) {
       [self.handles setObject:handle forKey:transaction];
       [self.objects setObject:transaction forKey:handle];
     }
-    NSString *status = PKStatus(transaction);
-    BOOL restored = transaction.transactionState == SKPaymentTransactionStateRestored;
-    SKPaymentTransaction *original = restored ? transaction.originalTransaction : nil;
-    SKPaymentTransaction *purchase = restored ? original : transaction;
-    includeReceipt |= [status isEqualToString:@"paid"];
-    [items addObject:@{
-      @"handle": handle, @"status": status,
-      @"productId": transaction.payment.productIdentifier,
-      @"allowsUnownedFinish": @(PKCatalogError(transaction.payment.productIdentifier) == nil),
-      @"queueId": transaction.transactionIdentifier ?: NSNull.null,
-      @"originalTransactionId": original.transactionIdentifier ?: NSNull.null,
-      @"transactionId": purchase.transactionIdentifier ?: NSNull.null,
-      @"token": purchase.payment.applicationUsername ?: NSNull.null
-    }];
+    NSDictionary *item = [self item:transaction handle:handle];
+    includeReceipt |= [item[@"status"] isEqualToString:@"paid"];
+    [items addObject:item];
   }
   return @{@"writer": self.writer ?: @"", @"transactions": items, @"receipt": includeReceipt ? (PKReceipt() ?: @"") : @""};
 }
@@ -151,18 +155,26 @@ static NSString *PKReceipt(void) {
 }
 
 - (void)paymentQueue:(SKPaymentQueue *)queue removedTransactions:(NSArray<SKPaymentTransaction *> *)transactions {
+  if (activeOwner != self) return;
+  NSMutableArray *items = [NSMutableArray array];
+  NSMutableArray<FlutterResult> *replies = [NSMutableArray array];
   for (SKPaymentTransaction *transaction in transactions) {
     NSString *handle = [self.handles objectForKey:transaction];
     if (handle) {
+      [items addObject:[self item:transaction handle:handle]];
       FlutterResult pending = self.finishReplies[handle];
+      if (pending) [replies addObject:pending];
       [self.finishReplies removeObjectForKey:handle];
       [self.finishSubmitted removeObject:transaction];
       [self.outcomes setObject:@"removed" forKey:handle];
       [self.objects removeObjectForKey:handle];
       [self.handles removeObjectForKey:transaction];
-      if (pending) pending(@"finished");
     }
   }
+  if (items.count) {
+    [self.channel invokeMethod:@"removed" arguments:@{@"writer": self.writer, @"transactions": items, @"receipt": @""}];
+  }
+  for (FlutterResult reply in replies) reply(@"finished");
 }
 
 // Only explicit attempts with a durable host order may add a payment.
@@ -189,6 +201,28 @@ static NSString *PKReceipt(void) {
   if ([status isEqualToString:@"pending"] || ![status isEqualToString:arguments[@"status"]]) {
     result(PKError(@"state_changed"));
     return;
+  }
+  NSDictionary *proof = arguments[@"verifiedQueue"];
+  if (proof) {
+    if (![proof isKindOfClass:NSDictionary.class]) { result(PKError(@"invalid_proof")); return; }
+    NSString *verified = proof[@"transactionId"];
+    if (![verified isKindOfClass:NSString.class] || !verified.length ||
+        transaction.transactionState != SKPaymentTransactionStatePurchased ||
+        ![transaction.transactionIdentifier isEqualToString:verified] ||
+        ![transaction.payment.productIdentifier isEqual:proof[@"productId"]] ||
+        ![(transaction.payment.applicationUsername ?: NSNull.null) isEqual:proof[@"token"]] ||
+        transaction.payment.quantity != 1 || PKCatalogError(transaction.payment.productIdentifier)) {
+      result(PKError(@"state_changed")); return;
+    }
+    // A second object can enter the queue after Dart checks its last snapshot.
+    for (SKPaymentTransaction *other in queue.transactions) {
+      if (other != transaction &&
+          ([other.transactionIdentifier isEqualToString:verified] ||
+           (other.transactionState == SKPaymentTransactionStateRestored &&
+            [other.originalTransaction.transactionIdentifier isEqualToString:verified]))) {
+        result(PKError(@"ambiguous_transaction")); return;
+      }
+    }
   }
   self.finishReplies[handle] = [result copy];
   [self.finishSubmitted addObject:transaction];

@@ -119,7 +119,7 @@ class _LegacyStore extends Fake implements AppleStore {
   }
 
   @override
-  Future<void> finish(StoreEvent event) async {
+  Future<void> finish(StoreEvent event, {bool verifiedQueue = false}) async {
     finished.add(event.transactionId);
   }
 

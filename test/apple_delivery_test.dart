@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'verified_queue_fixture.dart';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pay_kit/src/iap/apple_journal.dart';
 import 'package:pay_kit/src/iap/apple_payments.dart';
@@ -27,7 +29,7 @@ class _Store implements AppleStore {
   }
 
   @override
-  Future<void> finish(StoreEvent e) async {
+  Future<void> finish(StoreEvent e, {bool verifiedQueue = false}) async {
     await beforeFinish?.call(e);
     finished.add(e);
   }
@@ -207,24 +209,24 @@ void main() {
         verify: (r) async {
           seen.add(r);
           return ack(r,
-              verified: 'verified-${r.transactionId}',
+              verified: r.transactionId,
               outcome: r.additionalCharge
                   ? AppleOutcome.refunded
                   : AppleOutcome.delivered);
         });
-    store.paid(null, 'T1', queue: 'q1');
-    store.paid(null, 'T2', queue: 'q2');
+    store.paid(null, 'T1', queue: 'T1', handle: 'h1');
+    store.paid(null, 'T2', queue: 'T2', handle: 'h2');
     await payments.settle();
     for (final t in ['T1', 'T2']) {
-      final c = claim(t, verified: 'verified-$t');
-      await payments.reconcile(c);
+      final c = claim(t);
+      await proveQueue(payments, c);
       await payments.settle();
       await payments.reconcile(c);
       await payments.settle();
     }
     expect(seen.map((r) => r.purchaseToken), [null, null]);
     expect(seen.map((r) => r.additionalCharge), [false, true]);
-    expect(store.finished.map((r) => r.queueId), ['q1', 'q2']);
+    expect(store.finished.map((r) => r.queueId), ['T1', 'T2']);
     expect((await acct.lookup('order'))!.charges.map((r) => r.disposition),
         ['delivered', 'refunded']);
     expect(store.submissions, isEmpty);
@@ -233,6 +235,10 @@ void main() {
   test(
       'two independently observed aliases share a verified transaction and finish each queue item',
       () async {
+    final creator = payments.connect(scope: 'A', verify: (r) async => ack(r));
+    final token =
+        (await creator.buy(productId: 'coins', orderId: 'order')).attemptId!;
+    await restart();
     final verifies = <String>[];
     final acct = payments.connect(
         scope: 'A',
@@ -240,12 +246,12 @@ void main() {
           verifies.add(r.transactionId);
           return ack(r, verified: 'V');
         });
-    store.paid(null, 'T1', queue: 'q1');
-    store.paid(null, 'T2', queue: 'q2');
+    store.paid(token, 'T1', queue: 'q1');
+    store.paid(token, 'T2', queue: 'q2');
     await payments.settle();
-    await payments.reconcile(claim('T1', verified: 'V'));
+    await payments.reconcile(claim('T1', verified: 'V', token: token));
     await payments.settle();
-    await payments.reconcile(claim('T2', verified: 'V'));
+    await payments.reconcile(claim('T2', verified: 'V', token: token));
     await payments.settle();
     expect(verifies, ['T1']);
     expect(store.finished.map((r) => r.queueId), ['q1', 'q2']);

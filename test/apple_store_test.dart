@@ -64,6 +64,22 @@ void main() {
     }
   });
 
+  test('verified queue finish passes the identity to the native queue',
+      () async {
+    final calls = <MethodCall>[];
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      return 'finished';
+    });
+    await store.finish(event('current', 'paid', queueId: 'T'),
+        verifiedQueue: true);
+    expect(calls.single.arguments['verifiedQueue'], {
+      'transactionId': 'T',
+      'productId': 'coins',
+      'token': 'original-token'
+    });
+  });
+
   test('a missing or unknown outcome never acknowledges a finish', () async {
     final paid = event('object-A', 'paid', queueId: 'purchase');
     messenger.setMockMethodCallHandler(channel, (_) async => null);

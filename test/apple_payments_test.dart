@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'verified_queue_fixture.dart';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pay_kit/pay_kit.dart';
 import 'package:pay_kit/src/iap/apple_journal.dart';
@@ -42,7 +44,7 @@ class ProbeStore implements AppleStore {
   }
 
   @override
-  Future<void> finish(StoreEvent e) async {
+  Future<void> finish(StoreEvent e, {bool verifiedQueue = false}) async {
     if (failFinish) throw StateError('finish interrupted');
     finished.add(e);
     await afterFinish?.call();
@@ -53,12 +55,14 @@ class ProbeStore implements AppleStore {
   void event(String? token, String? id,
           {String receipt = 'good',
           String? queue,
+          String? handle,
           StoreStatus status = StoreStatus.paid}) =>
       stream.add([
         StoreEvent(
             productId: 'sku',
             token: token,
             transactionId: id,
+            native: handle,
             receipt: receipt,
             queueId: queue ?? id,
             status: status)
@@ -302,11 +306,11 @@ void main() {
     final seen = <AppleReceipt>[];
     login('A', (r) async {
       seen.add(r);
-      return delivered(r, verified: 'canonical');
+      return delivered(r);
     });
-    store.event(null, 'reported');
+    store.event(null, 'reported', handle: 'current');
     await drain();
-    await pay.reconcile(claim('reported', verified: 'canonical'));
+    await proveQueue(pay, claim('reported'));
     await drain();
     expect(seen.single.purchaseToken, isNull);
     expect(seen.single.attemptId, isNull);
@@ -657,13 +661,13 @@ void main() {
       }
       return delivered(r);
     });
-    store.event(null, 'orphan');
+    store.event(null, 'orphan', handle: 'orphan-handle');
     await pay.settle();
     final token = (await buy(a)).attemptId;
     store.event(token, 'primary');
     await checking.future;
     try {
-      await pay.reconcile(claim('orphan'));
+      await proveQueue(pay, claim('orphan'));
       await claimed.future;
     } finally {
       release.complete();

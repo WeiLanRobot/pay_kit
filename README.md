@@ -113,7 +113,7 @@ final snapshot = await account.buy(
 
 **订单和尝试。** 服务端创建业务订单。每个账号内订单号唯一，每次实际拉起有独立的 UUID。同一应用的生产、沙盒、本地测试和旧接口共同保留已登记的购买标识；跨环境重用 UUID 会在提交 Apple 付款前返回错误。同单并发调用共享商店结果。服务端预先登记尝试 UUID 可以支持重装后查回原单。跨设备限制重复付款时，服务端还需原子授权一个设备提交。页面退出时取消 subscription，账号退出时调用 `account.dispose()`。重新打开可使用 `account.lookup(orderId)` 或 `account.watch(orderId)` 查看持久状态。
 
-对于仅由服务端凭证恢复的订单，`AppleOrderSnapshot.attemptId` 和 `AppleReceipt.attemptId` 可以为空。重复购买该订单会返回已有扣款的状态。
+订单的 `phase` 表示整体状态。最近一次下单的进度见 `attemptId` 和 `attemptPhase`，每笔扣款经证实关联的尝试见 `charges[i].attemptId`。这些尝试 ID 都可以为空。例如同一订单有两次下单，验单已确认付款但无法区分哪次成功时，订单显示 `paid`，两次尝试仍可分别核对。重复购买已确认付款的订单会返回现有状态。
 
 账号退出后，尚未返回的购买请求会向旧调用方报告会话已结束。商店结果仍记录在原订单，重新登录后可查询。
 
@@ -136,15 +136,21 @@ final snapshot = await account.buy(
 
 **对账。** 只有受信的应用级恢复服务应读取 `await payments.unmatched()` 中的完整凭证，用 `payments.reconcile(AppleClaim(...))` 提交服务端确认的归属。无法查证的原商店 UUID 保持空值。尚无交易号的尝试可由受信恢复服务通过 `unresolvedAttempts()` 找到，再用 `resolveAttempt(AppleAttemptDecision(...))` 记录持久裁决。只有能证明本次未提交或最终未扣款的权威结论才允许重新购买。SDK 依赖宿主认证这些裁决和回执。服务端已发货但应答丢失时要返回原回执。
 
-同一笔已付款交易可能在两次启动中产生不同的观察 ID。受信恢复服务可以把要核对的 ID 放入 `AppleClaim.observationId`，然后调用 `await payments.recoverObservation(claim)`。返回值分别给出经核实的扣款处置和这一次观察的状态。例如，服务端已发货但无法证明当前队列项的来源时，`disposition` 可以是已发货，`state` 仍是 `AppleObservationState.sourceUnproven`。此时可以向用户展示已发权益，保留该观察继续核对。重启后出现新的观察 ID，应使用新 ID 办理该项。旧 `reconcile` 遇到多个来源未明的同号观察时，会抛出 `AppleAmbiguousObservation`，受信服务可改用上述入口核对具体观察。
+服务端独立核实了付款和订单归属后，可调用 `await payments.recordPayment(claim)`，即使设备上没有购买记录或当前队列项也能入账。以应用、真实环境及经 Apple 核实的交易号标识一笔扣款。发货或退款确认可以稍后通过同一接口补记。在账号订单的 `charges` 中，`verifiedTransactionId` 是服务端核实的 Apple 交易号，`transactionId` 是已经关联的设备报告号。该接口也可用于重试已认证的同一回执。
+
+同一笔已付款交易可能在两次启动中产生不同的观察 ID。受信恢复服务可以把要核对的 ID 放入 `AppleClaim.observationId`，然后调用 `await payments.recoverObservation(claim)`。返回值分别给出经核实的扣款处置和这一次观察的状态。例如，服务端已发货但无法证明当前队列项的来源时，`disposition` 可以是已发货，`state` 仍是 `AppleObservationState.sourceUnproven`。此时可以向用户展示已发权益，保留该观察继续核对。重启后出现新的观察 ID，应使用新 ID 办理该项。旧 `reconcile` 遇到单条来源待核的观察时，可先记录经服务端确认的付款。这时观察仍留在 `unmatched()`。遇到多条来源不明的同号观察时，会抛出 `AppleAmbiguousObservation`，受信服务可用上述入口核对具体观察。
 
 若要在重装后为某项补收尾，可以通过 `originalSubmission` 传入宿主已认证的 `AppleOriginalSubmission`。服务端须在购买前为这一次提交独占登记 UUID，并核实购买时 Apple 交易与原始 UUID、环境、商品及数量的对应关系。仅有事后设置的 token 或覆盖多笔交易的 App 收据时，可以提交已核实的最终处置，等待对象来源得到证明。
 
-旧版普通字符串订单没有购前 UUID，且商品在当前消耗品目录内时，宿主可从 `unmatched()` 返回的 `currentObservationIds` 选取当前观察 ID，将 `observations[id]` 中的候选收据交给自己的验单服务。收据暂缺时可按需调用 `refreshReceipts()`，再读取候选收据。服务端须验证 Apple 收据的签名、应用和真实环境，从中定位交易号与当前设备报告号完全相同、商品一致、数量为 1 的消耗品付款，并通过已有订单记录确认账号、原订单及最终履约结果。仅查到同商品或已发货，不足以签发证明。服务端为该观察出具唯一引用，并返回 `AppleVerifiedQueueTransaction` 所需字段；`receiptHash` 是对送验的原始 Base64 收据字符串按 UTF-8 计算的 SHA-256 小写十六进制摘要。
+旧版普通字符串订单没有购前 UUID，且商品在当前消耗品目录内时，宿主可从 `unmatched()` 返回的 `currentObservationIds` 选取当前观察 ID，将 `observations[id]` 中的候选收据交给自己的验单服务。收据暂缺时可按需调用 `refreshReceipts()`，再读取候选收据。服务端须验证 Apple 收据的签名、应用和真实环境，从中定位交易号与当前设备报告号完全相同、商品一致、数量为 1 的消耗品付款，并通过已有订单记录确认账号和原订单。仅查到同商品或已发货，不足以签发证明。服务端为该观察出具唯一引用，并返回 `AppleVerifiedQueueTransaction` 所需字段；`receiptHash` 是对送验的原始 Base64 收据字符串按 UTF-8 计算的 SHA-256 小写十六进制摘要。
 
-宿主用这份已认证的回复调用 `recoverObservation(claim, verifiedQueueTransaction: proof)`，将普通业务订单号放入 `orderId`，`purchaseToken` 留空。可随调用提交最终处置，或复用已入账的发货或退款回执。苹果重播产生新的观察时，应对新观察重新送验，按同一笔苹果交易复用履约结果。设备号和验单交易号不同、来源冲突或没有独立订单记录时，使用原有对账流程保留待核对状态。
+宿主用这份已认证的回复调用 `recoverObservation(claim, verifiedQueueTransaction: proof)`，将普通业务订单号放入 `orderId`，`purchaseToken` 留空。可以先证明队列项的来源，等发货或退款入账后再收尾。二者都具备时，SDK 只向 StoreKit 提交对应的当前对象。若队列里同时有两个同号对象，SDK 保留已核对到具体观察的证明，等另一个对象确认移除后重新检查并收尾。传错观察 ID、对象已过期或逐笔证明不符时，接口会抛出 `AppleObservationRejected`。另行认证且有效的付款和处置仍可从订单中查询。苹果重播产生新的观察时，应对新观察重新送验，按同一笔苹果交易复用履约结果。设备号和验单交易号不同、来源冲突或没有独立订单记录时，使用原有对账流程保留待核对状态。
 
-升级后继续用 `BuyEngine` 下单也可以走这条恢复路径。SDK 会核对本地记录：商店已明确受理，且订单号、商品、已知环境和账号归属都与服务端证明一致时，付款会关联到原来的购买尝试。兼容账本和环境账本中相同的尝试 ID 代表同一次提交。受理结果不确定、存在多次不同的提交或已有记录相互矛盾时，交易保留待核对。
+逐笔证明通过核对，但服务端确认的环境与当前账本不同时，SDK 保存这个对象的来源，返回 `awaitingReplay`，原因为 `verifiedOutsideActiveEnvironment`。宿主在实际环境启动后用 `recordPayment` 登记该环境的付款和处置；若 StoreKit 重播，再核对新观察。同一对象收到两份环境相反的合格证明时，该观察进入 `queueProofConflict` 并暂停收尾。
+
+升级后继续用 `BuyEngine` 下单也可以走这条恢复路径。本地的商店受理记录只说明某次下单已经提交。恢复时，要把扣款归到某次提交，还需要能连接两者的交易记录或独立凭据。旧收据回调已经交接、StoreKit 收尾前退出时，SDK 会核对原交接记录。旧回调交接本身只证明宿主收到过收据。即使同一订单存在多个下单尝试，受信服务仍可分别确认到账、履约和当前队列项，无法区分的尝试继续保留。
+
+若一笔 Apple 扣款出现多份发货回执，退款应通过 `supersedes` 指向被补偿的发货回执。只有服务端确认两个回执引用属于同一次实际发货时，才在这两份回执中填写相同的 `fulfillmentOperationId`。若它们代表两次实际发货，只补偿其中一次时，订单保留争议，后续回执可补足其余发货的补偿。
 
 若交易有相互冲突的认领或处置，`unmatched()` 会给出争议引用、当前修订号和回执引用。应用级服务将已认证的 `AppleDisputeReview` 传给 `AppleClaim` 的 `review` 参数。复核须指向当前争议；涉及已发货订单的补偿时，还须核对原履约回执。托管验单超时或切换账号后可能重试同一笔付款，服务端必须按应用、真实商店环境和核实的交易号原子去重。`AppleAttemptDecision` 须绑定环境；旧业务订单串缺失时，已付款裁决还须有能独立关联原提交的依据。
 

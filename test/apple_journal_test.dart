@@ -213,7 +213,7 @@ void main() {
         'legacy');
   });
 
-  test('v5 partitions preserve pending charges and migrate atomically to v6',
+  test('v5 partitions preserve pending charges and migrate atomically to v7',
       () async {
     // Save a paid, unconfirmed queue item in each environment; recreate the v5
     // schema rather than just changing user_version on a current database.
@@ -268,7 +268,7 @@ void main() {
       await journal.select('app', env);
       await journal.read((db) async {
         expect(
-            (await db.rawQuery('PRAGMA user_version')).single.values.single, 6);
+            (await db.rawQuery('PRAGMA user_version')).single.values.single, 7);
         final charge = (await db.query('purchase')).single;
         expect(charge['id'], env);
         expect(charge['lastTimeoutSeq'], isNull);

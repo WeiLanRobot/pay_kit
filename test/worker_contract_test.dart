@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'verified_queue_fixture.dart';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pay_kit/src/iap/apple_journal.dart';
 import 'package:pay_kit/src/iap/apple_payments.dart';
@@ -216,9 +218,9 @@ void main() {
           verifiedTransactionId: 'T',
           reference: uuid == null ? 'ownership' : 'submission',
           purchaseToken: uuid);
-      store.event(null, 'T');
+      store.event(null, 'T', handle: 'worker');
       await pay.settle();
-      await pay.reconcile(claim(null));
+      await proveQueue(pay, claim(null));
       await entered.future;
       expect(seen.single.attemptId, isNull);
       if (replyFirst) {
@@ -321,7 +323,7 @@ void main() {
           return const AppleVerification.invalidEvidence();
         });
     store.event(null, 'orphan', receipt: '');
-    store.event(null, 'claimed', receipt: 'previous');
+    store.event(null, 'claimed', receipt: 'previous', handle: 'claimed-handle');
     await pay.settle();
     final refresh = pay.refreshReceipts();
     await store.refreshing.future;
@@ -333,15 +335,17 @@ void main() {
               ? delivered(r)
               : const AppleVerification.invalidEvidence();
         });
-    await pay.reconcile(const AppleClaim(
-        appId: 'app',
-        environment: 'sandbox',
-        scope: 'B',
-        orderId: 'B-order',
-        productId: 'sku',
-        reportedTransactionId: 'claimed',
-        verifiedTransactionId: 'claimed',
-        reference: 'claim-B'));
+    await proveQueue(
+        pay,
+        const AppleClaim(
+            appId: 'app',
+            environment: 'sandbox',
+            scope: 'B',
+            orderId: 'B-order',
+            productId: 'sku',
+            reportedTransactionId: 'claimed',
+            verifiedTransactionId: 'claimed',
+            reference: 'claim-B'));
     await pay.settle();
     store.event(null, 'new', receipt: '');
     store.refreshed.complete('fresh');

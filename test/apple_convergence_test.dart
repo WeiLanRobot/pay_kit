@@ -210,7 +210,7 @@ void main() {
     observe(token, 'alias', 'S', 'S');
     await settle();
     await p.reconcile(claim('S', token, 'T'));
-    a = connect();
+    a = p.connect(scope: 'A', verify: (r) async => delivered(r, verified: 'T'));
     await settle();
     expect((await a.lookup('O'))!.charges, hasLength(1));
     expect(
@@ -218,7 +218,7 @@ void main() {
             .attemptId,
         token);
     expect(store.submitted, hasLength(1));
-    expect(store.finished, hasLength(2));
+    expect(store.finished.map((item) => item.native), ['alias']);
   });
   test(
       'the original queue object retains its token when its later callback omits it',
@@ -235,7 +235,7 @@ void main() {
     await settle();
     expect((await a.lookup('O'))!.attemptId, token);
     expect(seen, hasLength(1));
-    expect(store.finished, hasLength(2));
+    expect(store.finished.map((item) => item.native), ['original']);
   });
   test(
       'a provisional object and another wrapper for one stable queue item finish once',

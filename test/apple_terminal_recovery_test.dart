@@ -14,13 +14,13 @@ class _RetryStore extends ProbeStore {
   int calls = 0;
 
   @override
-  Future<void> finish(StoreEvent event) async {
+  Future<void> finish(StoreEvent event, {bool verifiedQueue = false}) async {
     if (++calls == 1) {
       firstCall.complete();
       await failFirst.future;
       throw StateError('temporary');
     }
-    return super.finish(event);
+    return super.finish(event, verifiedQueue: verifiedQueue);
   }
 }
 

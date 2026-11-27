@@ -29,6 +29,7 @@ class AppleDisposition {
       required this.verifiedTransactionId,
       required this.reference,
       this.supersedes,
+      this.fulfillmentOperationId,
       this.quantity = 1,
       this.outcome = AppleOutcome.delivered});
   final String appId, environment, scope, orderId, productId;
@@ -36,6 +37,11 @@ class AppleDisposition {
 
   /// A verified refund or compensation can explicitly replace this receipt.
   final String? supersedes;
+
+  /// The authenticated fulfillment operation behind a delivery receipt.
+  /// Supply the same ID only when the server confirms that two receipt
+  /// references describe one actual grant for the same verified charge.
+  final String? fulfillmentOperationId;
   final int quantity;
   final AppleOutcome outcome;
 }
@@ -171,10 +177,14 @@ class AppleOrderSnapshot {
       required this.phase,
       required this.revision,
       required this.charges,
+      this.attemptPhase,
       this.unpaidFinishPending = false,
       this.reason});
   final String scope, orderId, productId, phase;
   final String? attemptId;
+
+  /// State of this specific launch, independent of the order payment status.
+  final String? attemptPhase;
   final String? reason;
   final int revision;
   final List<AppleCharge> charges;
@@ -186,12 +196,18 @@ class AppleOrderSnapshot {
 class AppleCharge {
   const AppleCharge(
       {required this.transactionId,
+      this.verifiedTransactionId,
+      this.attemptId,
       required this.disposition,
       required this.reference,
       required this.finishPending,
       required this.conflict,
       this.reason});
   final String? transactionId, disposition, reference, reason;
+  final String? verifiedTransactionId;
+
+  /// Only populated when this charge is linked to a particular submission.
+  final String? attemptId;
 
   /// True until the SDK has recorded removal of every known StoreKit queue
   /// item for this charge. Also true when no queue item has been observed.
@@ -211,6 +227,7 @@ class AppleTransaction {
       required this.purchaseToken,
       required this.receipts,
       required this.observations,
+      this.verifiedTransactionId,
       this.currentObservationIds = const {},
       this.disputeId,
       this.disputeRevision,
@@ -220,6 +237,7 @@ class AppleTransaction {
       this.reason});
   final String id, productId;
   final String? transactionId, purchaseToken, reason;
+  final String? verifiedTransactionId;
   final List<String> receipts;
   final Map<String, List<String>> observations;
 
@@ -322,6 +340,13 @@ class AppleRecoveryResult {
       disposition,
       reference,
       reason;
+}
+
+/// The queue item could not be accepted. An authenticated payment for the
+/// active environment is still recorded and can be queried on its order.
+class AppleObservationRejected extends StateError {
+  AppleObservationRejected(this.observationId, super.message);
+  final String observationId;
 }
 
 class AppleAmbiguousObservation extends StateError {

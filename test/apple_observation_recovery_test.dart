@@ -10,7 +10,7 @@ import 'package:pay_kit/pay_kit.dart';
 import 'package:pay_kit/src/iap/apple_journal.dart';
 import 'package:pay_kit/src/iap/apple_store.dart';
 
-import 'apple_payments_test.dart' show ProbeStore;
+import 'apple_payments_test.dart' show ProbeStore, delivered;
 
 void main() {
   const token = '254adff7-e1d1-452d-89fa-4a3872371a68';
@@ -61,6 +61,19 @@ void main() {
             whereArgs: ['handle:$handle'],
             orderBy: 'rowid DESC'))
         .first['id'] as String);
+  }
+
+  void removed(String handle) {
+    store.stream.add([
+      StoreEvent(
+          productId: 'sku',
+          native: handle,
+          transactionId: 'R',
+          queueId: 'R',
+          status: StoreStatus.paid,
+          removed: true,
+          needsFinish: false)
+    ]);
   }
 
   AppleClaim claim(String? id,
@@ -169,9 +182,9 @@ void main() {
     reply.complete(const AppleVerification.needsReconciliation());
     await pay.settle();
     expect(
-        (await journal.read((db) => db.query('purchase')))
-            .single['blockedLogin'],
-        isNull);
+        await journal.read(
+            (db) => db.query('purchase', where: 'blockedLogin IS NOT NULL')),
+        isEmpty);
     await close();
     await start();
     await pay.refreshReceipts();
@@ -231,8 +244,11 @@ void main() {
         throwsA(isA<AppleAmbiguousObservation>()));
     final waiting =
         await pay.recoverObservation(claim(second, terminal: false));
-    expect(waiting.reason, 'dispositionOrSourceRequired');
-    expect(await account.lookup('order'), isNull);
+    expect(waiting.state, AppleObservationState.sourceUnproven);
+    final payment = (await account.lookup('order'))!;
+    expect(payment.phase, 'paid');
+    expect(payment.charges.single.disposition, isNull);
+    expect(payment.charges.single.attemptId, isNull);
     for (final id in [first, second, second]) {
       final result = await pay.recoverObservation(claim(id));
       expect(result.state, AppleObservationState.sourceUnproven);
@@ -275,7 +291,10 @@ void main() {
     await expectLater(
         pay.recoverObservation(claim(first, wire: token),
             originalSubmission: original(quantity: 2)),
-        throwsStateError);
+        throwsA(isA<AppleObservationRejected>()));
+    expect((await account.lookup('order'))!.charges.single.disposition,
+        'delivered');
+    expect(store.finished, isEmpty);
     final booked = await pay.recoverObservation(claim(first, wire: token));
     expect(booked.state, AppleObservationState.sourceUnproven);
     store.failFinish = true;
@@ -303,6 +322,188 @@ void main() {
     expect(verifications, 0);
   });
 
+  test(
+      'a local verifier merges a device transaction into a server-only payment',
+      () async {
+    account = pay.connect(
+        scope: 'A', verify: (r) async => delivered(r, verified: 'V'));
+    final launch = await account.buy(
+        productId: 'sku', orderId: 'order', purchaseToken: token);
+    await pay.recordPayment(claim(null, terminal: false));
+    store.event(token, 'R');
+    await pay.settle();
+    final paid = (await account.lookup('order'))!.charges.single;
+    expect(paid.verifiedTransactionId, 'V');
+    expect(paid.transactionId, 'R');
+    expect(paid.attemptId, launch.attemptId);
+    expect(paid.disposition, 'delivered');
+    expect(paid.finishPending, isFalse);
+    expect(store.finished, hasLength(1));
+  });
+
+  test('old original-only claims are imported before replay can finish',
+      () async {
+    await journal.write((db) async {
+      await db.update('meta', {'originalPaymentsRestored': 0});
+      await db.insert('recovery.original_submission', {
+        'appId': 'app',
+        'token': token,
+        'issuer': 'server',
+        'reference': 'old-original',
+        'environment': 'sandbox',
+        'scope': 'B',
+        'orderId': 'order',
+        'productId': 'sku',
+        'verifiedId': 'R',
+        'reportedId': 'R',
+      });
+    });
+    await close();
+    await start();
+    final current = await observe('fresh');
+    await expectLater(
+        pay.recoverObservation(claim(current, verified: 'R'),
+            verifiedQueueTransaction: verifiedItem(current)),
+        throwsStateError);
+    await pay.settle();
+    expect((await account.lookup('order'))!.phase, 'conflict');
+    expect(store.finished, isEmpty);
+    await close();
+    await start();
+    expect((await account.lookup('order'))!.phase, 'conflict');
+  });
+
+  test('authenticated payment survives restart without a device observation',
+      () async {
+    await pay.recordPayment(claim(null, terminal: false));
+    await pay.recordPayment(claim(null, terminal: false));
+    await pay.refreshReceipts();
+    await close();
+    await start();
+    final status = await account.buy(productId: 'sku', orderId: 'order');
+    expect(status.phase, 'paid');
+    expect(status.attemptId, isNull);
+    expect(status.charges.single.verifiedTransactionId, 'V');
+    expect(status.charges.single.transactionId, isNull);
+    expect(store.submitted, isEmpty);
+    final pending = (await pay.unmatched()).single;
+    expect(pending.verifiedTransactionId, 'V');
+    expect(pending.observations, isEmpty);
+    expect(pending.receipts, isEmpty);
+    await pay.recordPayment(claim(null));
+    await pay.recordPayment(claim(null));
+    expect((await account.lookup('order'))!.charges.single.reference, 'ack');
+    final other = pay.connect(
+        scope: 'B', verify: (_) async => const AppleVerification.retryLater());
+    expect(await other.lookup('order'), isNull);
+    await other.buy(productId: 'sku', orderId: 'order');
+    expect(store.submitted, hasLength(1));
+    expect(store.finished, isEmpty);
+  });
+
+  test('authenticated submission decision can precede exact replay proof',
+      () async {
+    final launch = await account.buy(
+        productId: 'sku', orderId: 'order', purchaseToken: token);
+    await close();
+    await start();
+    await observe('old');
+    await close();
+    await start();
+    final current = await observe('current');
+    await pay.recordPayment(claim(null, verified: 'R'));
+    final before = (await account.lookup('order'))!;
+    expect(before.phase, 'paid');
+    expect(before.attemptPhase, 'accepted');
+    expect(before.charges.single.attemptId, isNull);
+    final decision = AppleAttemptDecision(
+        issuer: 'backend',
+        decisionId: 'link',
+        appId: 'app',
+        environment: 'sandbox',
+        attemptId: launch.attemptId!,
+        scope: 'A',
+        orderId: 'order',
+        reference: 'verified-link',
+        outcome: AppleAttemptOutcome.paid,
+        attemptProof: 'original-submission',
+        claim: claim(null, verified: 'R'));
+    await pay.resolveAttempt(decision);
+    await pay.resolveAttempt(decision);
+    await pay.settle();
+    final after = (await account.lookup('order'))!;
+    expect(after.attemptPhase, 'paid');
+    expect(after.charges.single.attemptId, launch.attemptId);
+    expect(after.charges.single.transactionId, isNull);
+    expect(store.finished, isEmpty);
+    expect(
+        (await pay.unmatched())
+            .any((t) => t.currentObservationIds.contains(current)),
+        isTrue);
+    await pay.recoverObservation(claim(current, verified: 'R'),
+        verifiedQueueTransaction: verifiedItem(current));
+    await pay.settle();
+    expect(store.finished.map((e) => e.native), ['current']);
+    expect((await account.lookup('order'))!.charges.single.attemptId,
+        launch.attemptId);
+  });
+
+  test(
+      'legacy reconcile can book the one matching report without authorizing its object',
+      () async {
+    final id = await observe('single-unowned');
+    await pay.reconcile(claim(null, verified: 'R'));
+    await pay.retryPending();
+    await pay.settle();
+    final payment = (await account.lookup('order'))!.charges.single;
+    expect(payment.verifiedTransactionId, 'R');
+    expect(payment.transactionId, isNull);
+    expect(payment.reference, 'ack');
+    expect(payment.attemptId, isNull);
+    expect((await pay.unmatched()).single.currentObservationIds, {id});
+    expect(store.finished, isEmpty);
+    expect(verifications, 0);
+    await pay.recoverObservation(claim(id, verified: 'R', terminal: false),
+        verifiedQueueTransaction: verifiedItem(id));
+    await pay.settle();
+    expect(store.finished.map((event) => event.native), ['single-unowned']);
+    expect((await account.lookup('order'))!.charges.single.reference, 'ack');
+    expect(verifications, 0);
+  });
+
+  test('a stale selector preserves money and cannot authorize a live handle',
+      () async {
+    await observe('unrelated', reported: 'different');
+    await expectLater(pay.recoverObservation(claim('missing')),
+        throwsA(isA<AppleObservationRejected>()));
+    final charge = (await account.lookup('order'))!.charges.single;
+    expect(charge.verifiedTransactionId, 'V');
+    expect(charge.disposition, 'delivered');
+    expect(charge.transactionId, isNull);
+    await pay.retryPending();
+    await pay.settle();
+    expect(store.finished, isEmpty);
+  });
+
+  test('conflicting authenticated ownership survives rejected object proof',
+      () async {
+    final live = await observe('current', wire: 'order');
+    await pay.recordPayment(claim(null, verified: 'R', terminal: false));
+    await expectLater(
+        pay.recoverObservation(claim(live, owner: 'B', verified: 'R'),
+            verifiedQueueTransaction: verifiedItem(live, owner: 'B')),
+        throwsStateError);
+    await expectLater(
+        pay.recoverObservation(claim(live, verified: 'R'),
+            verifiedQueueTransaction: verifiedItem(live)),
+        throwsStateError);
+    await pay.retryPending();
+    await pay.settle();
+    expect((await account.lookup('order'))!.phase, 'conflict');
+    expect((await pay.unmatched()).any((t) => t.disputeId != null), isTrue);
+    expect(store.finished, isEmpty);
+  });
+
   Future<String> submitLegacyOrder() async {
     final owner = Object();
     pay.attachLegacy(owner, (_) async {}, (_, __) {}, (_) {});
@@ -327,7 +528,7 @@ void main() {
         if (change == 'attempt conflict') {
           expect(
               await db.update('attempt', {'phase': 'conflict'},
-                  where: "id=? AND phase='paid'", whereArgs: [attempt]),
+                  where: "id=? AND phase='accepted'", whereArgs: [attempt]),
               1);
         } else {
           await db.insert('recovery.submission', {
@@ -384,7 +585,7 @@ void main() {
   test(
       'legacy proof preserves the scoped purchase already bound to this transaction',
       () async {
-    await submitLegacyOrder();
+    final legacy = await submitLegacyOrder();
     final active = await account.buy(
         productId: 'sku', orderId: 'order', purchaseToken: token);
     store.event(token, 'R');
@@ -400,10 +601,8 @@ void main() {
     await close();
     await start();
     final id = await observe('replay-without-token');
-    await expectLater(
-        pay.recoverObservation(claim(id, verified: 'R'),
-            verifiedQueueTransaction: verifiedItem(id)),
-        throwsStateError);
+    await pay.recoverObservation(claim(id, verified: 'R'),
+        verifiedQueueTransaction: verifiedItem(id));
     await pay.settle();
     await journal.read((db) async {
       final charge = (await db.query('purchase')).single;
@@ -411,9 +610,14 @@ void main() {
       expect(charge['conflict'], 0);
       expect(charge['disposition'], 'delivered');
       expect(await db.query('conflict_fact'), isEmpty);
-      expect(await db.query('recovery.verified_queue_transaction'), isEmpty);
+      expect(
+          (await db.query('recovery.verified_queue_transaction'))
+              .single['observation'],
+          id);
     });
-    expect(store.finished, isEmpty);
+    expect(
+        store.finished.map((event) => event.native), ['replay-without-token']);
+    expect((await pay.unresolvedAttempts()).single.attemptId, legacy);
   });
 
   for (final competing in [false, true]) {
@@ -437,9 +641,13 @@ void main() {
           verified: 'P',
           reference: 'ack-prod'));
       await pay.settle();
-      await journal.read((db) async {
+      // A v6 reconciliation could have retained the reported business string
+      // even without an attempt in this partition. Preserve its conflict guard.
+      await journal.write((db) async {
         expect(await db.query('attempt'), isEmpty);
-        expect((await db.query('purchase')).single['token'], candidate);
+        expect((await db.query('purchase')).single['token'], isNull);
+        await db.update('purchase', {'token': candidate},
+            where: 'verifiedId=?', whereArgs: ['P']);
       });
       await close();
       await start('sandbox');
@@ -509,7 +717,7 @@ void main() {
       expect(store.finished, isEmpty);
       await journal.read((db) async {
         expect(await db.query('recovery.verified_queue_transaction'), isEmpty);
-        expect(await db.query('disposition_fact'), isEmpty);
+        expect(await db.query('disposition_fact'), hasLength(1));
         final observation = (await db
                 .query('recovery.observation', where: 'id=?', whereArgs: [id]))
             .single;
@@ -603,12 +811,15 @@ void main() {
         expect(store.finished.map((e) => e.native), ['finish-retry']);
         await journal.read((db) async {
           final purchase = (await db.query('purchase')).single;
-          expect(purchase['attemptId'], attemptId);
+          expect(purchase['attemptId'], isNull);
           expect(purchase['disposition'], 'delivered');
-          expect(
-              (await db.query('attempt', where: 'id=?', whereArgs: [attemptId]))
-                  .single['phase'],
-              'paid');
+          final attempts =
+              await db.query('attempt', where: 'id=?', whereArgs: [attemptId]);
+          if (mode == 'compatibility') {
+            expect(attempts, isEmpty);
+          } else {
+            expect(attempts.single['phase'], pending ? 'pending' : 'accepted');
+          }
         });
         checkoutFinished = Completer<void>();
         next.buyProduct('sku', 'next-order');
@@ -618,6 +829,148 @@ void main() {
       });
     }
   }
+
+  test(
+      'a repeated report on a replacement object cannot inherit the original callback',
+      () async {
+    final page = Object();
+    var received = 0;
+    pay.attachLegacy(page, (_) async {
+      received++;
+    }, (_, __) {}, (_) {});
+    await pay.buyLegacy(page, 'sku', 'order');
+    store.failFinish = true;
+    store.event('order', 'R', handle: 'original');
+    await pay.settle();
+    expect(received, 1);
+    store.event('order', 'R', handle: 'replacement');
+    await pay.settle();
+    store.failFinish = false;
+    await pay.retryPending();
+    await pay.settle();
+    expect(store.finished, isEmpty);
+    expect(received, 1);
+  });
+
+  test(
+      'a directly observed legacy payment retains its original submission after a cold replay',
+      () async {
+    final legacy =
+        await submitLegacyOrder(); // The receiver has already detached.
+    store.event('order', 'R', handle: 'original-object');
+    await pay.settle();
+    expect(store.finished, isEmpty);
+    await close();
+    await start();
+    final id = await observe('cold-object');
+    await pay.recoverObservation(claim(id, verified: 'R', terminal: false),
+        verifiedQueueTransaction: verifiedItem(id));
+    await pay.settle();
+    expect(store.finished, isEmpty);
+    expect((await account.lookup('order'))!.charges.single.attemptId, legacy);
+    await pay.recordPayment(claim(null, verified: 'R'));
+    await pay.settle();
+    expect(store.finished.map((event) => event.native), ['cold-object']);
+    final settled = (await account.lookup('order'))!.charges.single;
+    expect(settled.attemptId, legacy);
+    expect(settled.finishPending, isFalse);
+  });
+
+  for (final (recorded, managed) in [
+    (true, false),
+    (false, false),
+    (true, true)
+  ]) {
+    test(
+        'exact recovery checks the original handoff (recorded=$recorded, managed=$managed)',
+        () async {
+      await close();
+      store = ProbeStore();
+      journal = AppleJournal(() async => File('${dir.path}/ledger'));
+      pay = ApplePayments.forTesting(store, journal);
+      if (managed) await pay.start(environment: 'sandbox');
+      final page = Object();
+      var handoffs = 0;
+      pay.attachLegacy(page, (_) async {
+        handoffs++;
+      }, (_, __) {}, (_) {});
+      await pay.buyLegacy(page, 'sku', 'order');
+      store.failFinish = true;
+      store.event('order', 'R');
+      await pay.settle();
+      expect(handoffs, 1);
+      final attempt = await journal.read((db) async {
+        final p = (await db.query('purchase')).single;
+        expect(p['disposition'], 'legacyHandedOff');
+        return p['attemptId'];
+      });
+      expect(store.finished, isEmpty);
+      if (!recorded) {
+        await journal.write((db) => db.delete('legacy_handoff'));
+      }
+      await close();
+      await start();
+      await observe('first-replay');
+      await close();
+      await start();
+      final current = await observe('current');
+      final proof = verifiedItem(current);
+      if (!recorded) {
+        await expectLater(
+            pay.recoverObservation(claim(current, verified: 'R'),
+                verifiedQueueTransaction: proof),
+            throwsStateError);
+        await pay.settle();
+        expect(store.finished, isEmpty);
+        expect(
+            (await account.lookup('order'))!.charges.single.attemptId, isNull);
+        return;
+      }
+      final waiting = await pay.recoverObservation(
+          claim(current, verified: 'R', terminal: false),
+          verifiedQueueTransaction: proof);
+      expect(waiting.state, AppleObservationState.awaitingDisposition);
+      expect(waiting.disposition, isNull);
+      await pay.settle();
+      expect(store.finished, isEmpty);
+      await pay.recoverObservation(claim(current, verified: 'R'),
+          verifiedQueueTransaction: proof);
+      await pay.settle();
+      expect(store.finished.map((e) => e.native), ['current']);
+      await journal.read((db) async {
+        final p = (await db.query('purchase')).single;
+        expect(p['attemptId'], attempt);
+        expect(p['disposition'], 'delivered');
+      });
+    });
+  }
+
+  test(
+      'two accepted submissions for one order cannot identify a tokenless payment',
+      () async {
+    final legacy = await submitLegacyOrder();
+    final scoped = await account.buy(
+        productId: 'sku', orderId: 'order', purchaseToken: token);
+    await close();
+    await start();
+    await observe('first-replay');
+    await close();
+    await start();
+    final current = await observe('current');
+    await pay.recoverObservation(claim(current, verified: 'R'),
+        verifiedQueueTransaction: verifiedItem(current));
+    await pay.settle();
+    expect(store.finished.map((e) => e.native), ['current']);
+    await journal.read((db) async {
+      final p = (await db.query('purchase')).single;
+      expect(p['attemptId'], isNull);
+      expect(p['disposition'], 'delivered');
+      final attempts = await db.query('attempt');
+      expect(attempts.map((a) => a['id']),
+          unorderedEquals([legacy, scoped.attemptId]));
+      expect(attempts.map((a) => a['phase']), everyElement('accepted'));
+    });
+  });
 
   test('legacy replay finishes only the verified item on a shared app receipt',
       () async {
@@ -644,10 +997,6 @@ void main() {
             verifiedQueueTransaction: verifiedItem(other, transaction: 'R2')),
         throwsStateError);
     await expectLater(
-        pay.recoverObservation(claim(current, owner: 'B', verified: 'R'),
-            verifiedQueueTransaction: verifiedItem(current, owner: 'B')),
-        throwsStateError);
-    await expectLater(
         pay.recoverObservation(currentClaim,
             verifiedQueueTransaction: verifiedItem(prior)),
         throwsStateError);
@@ -660,7 +1009,19 @@ void main() {
         AppleObservationState.removed);
     await pay.settle();
     expect(store.finished.map((e) => e.native), ['current']);
-    expect((await account.lookup('order'))!.charges.single.reference, 'ack');
+    final charges = (await account.lookup('order'))!.charges;
+    expect(charges.map((c) => c.verifiedTransactionId),
+        unorderedEquals(['R', 'R2']));
+    expect(
+        charges
+            .singleWhere((c) => c.verifiedTransactionId == 'R')
+            .finishPending,
+        isFalse);
+    expect(
+        charges
+            .singleWhere((c) => c.verifiedTransactionId == 'R2')
+            .transactionId,
+        isNull);
     expect(verifications, 0);
   });
 
@@ -700,7 +1061,8 @@ void main() {
     expect(verifications, 0);
   });
 
-  test('invalid queue proof leaves the observation and charge unassigned',
+  test(
+      'invalid queue proof cannot attach an authenticated payment to an observation',
       () async {
     final excluded = await observe('outside-catalog',
         reported: 'off-catalog', allowsUnownedFinish: false);
@@ -727,23 +1089,163 @@ void main() {
         pay.recoverObservation(claim(id),
             verifiedQueueTransaction: verifiedItem(id)),
         throwsStateError);
-    await expectLater(
-        pay.recoverObservation(claim(id, verified: 'R', terminal: false),
-            verifiedQueueTransaction: verifiedItem(id)),
-        throwsStateError);
     final duplicate = await observe('different-current-handle');
     expect(duplicate, isNot(id));
     await expectLater(
         pay.recoverObservation(matching,
-            verifiedQueueTransaction: verifiedItem(id)),
+            verifiedQueueTransaction: verifiedItem(duplicate)),
         throwsStateError);
     await pay.settle();
     expect(store.finished, isEmpty);
-    expect(await account.lookup('order'), isNull);
+    final charges = (await account.lookup('order'))!.charges;
+    expect(charges.map((c) => c.verifiedTransactionId),
+        unorderedEquals(['off-catalog', 'R', 'V']));
+    expect(charges.every((c) => c.attemptId == null && c.transactionId == null),
+        isTrue);
     expect(await journal.read((db) => db.query('queue_item')), isEmpty);
     expect(await journal.read((db) => db.query('recovery.observation_review')),
         isEmpty);
   });
+
+  test('opposing authenticated proofs revoke only the selected handle',
+      () async {
+    final current = await observe('challenged');
+    final proof = verifiedItem(current);
+    await pay.recoverObservation(claim(current, verified: 'R', terminal: false),
+        verifiedQueueTransaction: proof);
+    await expectLater(
+        pay.recoverObservation(claim(current, owner: 'B', verified: 'R'),
+            verifiedQueueTransaction: verifiedItem(current, owner: 'B')),
+        throwsStateError);
+    await journal.read((db) async {
+      final h = (await db.query('recovery.observation',
+              where: 'id=?', whereArgs: [current]))
+          .single;
+      expect(h['reason'], 'queueProofConflict');
+      expect(
+          (await db.query('recovery.verified_queue_transaction'))
+              .single['scope'],
+          'A');
+      expect((await db.query('purchase')).single['conflict'], 1);
+    });
+    await pay.retryPending();
+    await pay.settle();
+    expect(store.finished, isEmpty);
+  });
+
+  for (final foreignFirst in [false, true]) {
+    test(
+        'opposing environments hold one current object (foreign first: $foreignFirst)',
+        () async {
+      final id = await observe('challenged');
+      final local = claim(id, verified: 'R', terminal: false);
+      final foreign = claim(id, verified: 'R', env: 'production');
+      final foreignProof = verifiedItem(id,
+          environment: 'production', reference: 'production-proof');
+      if (foreignFirst) {
+        final held = await pay.recoverObservation(foreign,
+            verifiedQueueTransaction: foreignProof);
+        expect(held.reason, 'verifiedOutsideActiveEnvironment');
+        expect(await account.lookup('order'), isNull);
+        await observe('alias');
+        await expectLater(
+            pay.recoverObservation(local,
+                verifiedQueueTransaction: verifiedItem(id)),
+            throwsA(isA<AppleObservationRejected>()));
+      } else {
+        await pay.recoverObservation(local,
+            verifiedQueueTransaction: verifiedItem(id));
+        await observe('alias');
+        await expectLater(
+            pay.recoverObservation(foreign,
+                verifiedQueueTransaction: foreignProof),
+            throwsA(isA<AppleObservationRejected>()));
+      }
+      removed('alias');
+      await pay.settle();
+      await pay.recordPayment(claim(null, verified: 'R'));
+      await pay.retryPending();
+      await pay.settle();
+      expect(store.finished, isEmpty);
+      final charge = (await account.lookup('order'))!.charges.single;
+      expect(charge.disposition, 'delivered');
+      final held = await journal.read((db) async =>
+          (await db.query('recovery.verified_queue_transaction')).single);
+      final opposing = jsonDecode(held['opposingProof'] as String) as Map;
+      expect({held['environment'], opposing['environment']},
+          {'sandbox', 'production'});
+      expect(
+          await journal.read((db) async => (await db.query(
+                  'recovery.observation',
+                  where: 'id=?',
+                  whereArgs: [id]))
+              .single['reason']),
+          'queueProofConflict');
+      removed('challenged');
+      await pay.settle();
+      final fresh = await observe('separate');
+      await pay.recoverObservation(claim(fresh, verified: 'R'),
+          verifiedQueueTransaction: verifiedItem(fresh));
+      await pay.settle();
+      expect(store.finished.map((e) => e.native), ['separate']);
+      await close();
+      await start('production');
+      expect(await account.lookup('order'), isNull);
+      await pay.recordPayment(foreign);
+      expect((await account.lookup('order'))!.charges.single.disposition,
+          'delivered');
+      final prod = await observe('production-object');
+      await pay.recoverObservation(
+          claim(prod, verified: 'R', env: 'production'),
+          verifiedQueueTransaction:
+              verifiedItem(prod, environment: 'production'));
+      await pay.settle();
+      expect(store.finished.map((e) => e.native), ['production-object']);
+    });
+  }
+
+  test('unmatched foreign proof leaves the current source usable', () async {
+    final id = await observe('eligible');
+    final local = claim(id, verified: 'R', terminal: false);
+    await pay.recoverObservation(local,
+        verifiedQueueTransaction: verifiedItem(id));
+    final foreign = claim(id, verified: 'R', env: 'production');
+    for (final wrong in [
+      verifiedItem(id, environment: 'sandbox'),
+      verifiedItem(id, environment: 'production', receipt: 'other bytes'),
+      verifiedItem(id, environment: 'production', transaction: 'different'),
+      verifiedItem('stale', environment: 'production'),
+      verifiedItem(id, environment: 'production', quantity: 2),
+    ]) {
+      await expectLater(
+          pay.recoverObservation(foreign, verifiedQueueTransaction: wrong),
+          throwsA(isA<AppleObservationRejected>()));
+    }
+    await expectLater(pay.recordPayment(foreign), throwsStateError);
+    await pay.recordPayment(claim(null, verified: 'R'));
+    await pay.settle();
+    expect(store.finished.map((e) => e.native), ['eligible']);
+  });
+
+  for (final duplicateFirst in [false, true]) {
+    test(
+        'removal resumes the verified object (duplicate first: $duplicateFirst)',
+        () async {
+      final first = await observe('first');
+      if (duplicateFirst) await observe('duplicate');
+      await pay.recoverObservation(claim(first, verified: 'R', terminal: false),
+          verifiedQueueTransaction: verifiedItem(first));
+      await pay.settle();
+      if (!duplicateFirst) await observe('duplicate');
+      await pay.recordPayment(claim(null, verified: 'R'));
+      await pay.settle();
+      expect(store.finished, isEmpty);
+
+      removed('duplicate');
+      await pay.settle();
+      expect(store.finished.map((e) => e.native), ['first']);
+    });
+  }
 
   test('conflicting queue evidence blocks retry of an authorized finish',
       () async {
@@ -877,7 +1379,7 @@ void main() {
   });
 
   test(
-      'an unknown dispute rolls back the observation marker for a legacy single candidate',
+      'an unsuccessful review and a legacy claim cannot authorize a lone device report',
       () async {
     final id = await observe('orphan');
     await expectLater(
@@ -895,8 +1397,14 @@ void main() {
       expect(await db.query('purchase'), isEmpty);
     });
     await pay.reconcile(claim(id));
+    await pay.retryPending();
     await pay.settle();
-    expect(store.finished, hasLength(1));
+    final charge = (await account.lookup('order'))!.charges.single;
+    expect(charge.verifiedTransactionId, 'V');
+    expect(charge.disposition, 'delivered');
+    expect(charge.transactionId, isNull);
+    expect(store.finished, isEmpty);
+    expect((await pay.unmatched()).single.currentObservationIds, {id});
   });
 
   test(

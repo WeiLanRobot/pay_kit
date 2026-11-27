@@ -2,13 +2,14 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'apple_arbitration_schema.dart';
+import 'apple_disposition_facts.dart';
 import 'apple_worker_schema.dart';
 
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
 
-const _ledgerVersion = 6;
+const _ledgerVersion = 7;
 
 /// The private SK1 ledger. Operations must contain only database work.
 /// SQLite holds the file's exclusive lock until [close], including between
@@ -28,7 +29,9 @@ class AppleJournal {
   /// Select one private ledger while holding the common application writer
   /// lock. The original filename remains the first managed environment.
   Future<void> select(String? app, String? environment,
-          {Set<String> handoff = const {}}) =>
+          {Set<String> handoff = const {},
+          Future<void> Function(DatabaseExecutor, String, String)?
+              restorePayments}) =>
       _enqueue(() async {
         final base = await _location();
         final previous = _selectedPath;
@@ -43,12 +46,12 @@ class AppleJournal {
 
         try {
           final main = await use(base.path);
-          // A v6 ledger restored with an older sidecar has lost authority facts.
+          // A ledger restored with an older sidecar has lost authority facts.
           // Detect the mismatch before registering the StoreKit observer.
           final facts = await main.rawQuery(
               "SELECT name FROM recovery.sqlite_master WHERE type='table' "
-              "AND name IN ('original_submission','observation_review')");
-          if (facts.length != 2) {
+              "AND name IN ('original_submission','observation_review','removed_object','legacy_payment_origin')");
+          if (facts.length != 4) {
             throw StateError('Incomplete Apple recovery ledger');
           }
           final header = (await main.query('meta')).single;
@@ -91,6 +94,12 @@ class AppleJournal {
               if (app != null) {
                 await db
                     .update('meta', {'appId': app, 'environment': environment});
+                if (environment != null &&
+                    restorePayments != null &&
+                    prior['originalPaymentsRestored'] == 0) {
+                  await restorePayments(db, app, environment);
+                  await db.update('meta', {'originalPaymentsRestored': 1});
+                }
               }
             });
           } finally {
@@ -179,6 +188,7 @@ class AppleJournal {
         }
         await _installV3(db);
         await _installV6(db);
+        await _installV7(db);
       },
       onUpgrade: (db, from, to) async {
         if (from < 1 || from >= _ledgerVersion) {
@@ -217,7 +227,18 @@ class AppleJournal {
           await installReviewedIdentityGuard(db);
           await restoreAppleIdentityDisputes(db);
         }
-        await _installV6(db);
+        if (from < 6) {
+          await _installV6(db);
+        } else {
+          final tables = await db.rawQuery(
+              "SELECT name FROM recovery.sqlite_master WHERE type='table' "
+              "AND name IN ('original_submission','observation_review')");
+          if (tables.length != 2) {
+            throw StateError('Incomplete Apple recovery ledger');
+          }
+        }
+        await _installV7(db);
+        await upgradeAppleDispositionCoverage(db);
       },
       onDowngrade: (db, from, to) async {
         throw StateError('Unsupported newer Apple ledger version $from');
@@ -262,14 +283,21 @@ class AppleJournal {
   /// writer lock, then bind the observation and its proof in one transaction.
   Future<T> recover<T>(
       Future<T> Function(DatabaseExecutor db, List<String> sources) op,
-      {String? legacyOrderId}) {
-    if (legacyOrderId == null) return write((tx) => op(tx, const ['main']));
+      {String? legacyOrderId,
+      String? queueItemId}) {
+    if (legacyOrderId == null && queueItemId == null) {
+      return write((tx) => op(tx, const ['main']));
+    }
     return _enqueue(() async {
       final db = await _open();
       final partitions = await db.rawQuery('''SELECT name
         FROM recovery.indexed_partition WHERE EXISTS (
-          SELECT 1 FROM recovery.submission WHERE origin='legacy' AND token=?)''',
-          [appleWireKey(legacyOrderId)]);
+          SELECT 1 FROM recovery.submission WHERE origin='legacy' AND token=COALESCE(?,
+            (SELECT v.orderId FROM queue_item q JOIN recovery.verified_queue_transaction v
+             ON q.observation=v.observation WHERE q.id=?)))''', [
+        legacyOrderId == null ? null : appleWireKey(legacyOrderId),
+        queueItemId
+      ]);
       final sources = ['main'];
       try {
         if (partitions.isNotEmpty) {
@@ -575,6 +603,36 @@ Future<void> _installV6(DatabaseExecutor db) async {
     AFTER UPDATE OF inputVersion ON purchase
     WHEN NEW.inputVersion != OLD.inputVersion AND NEW.lastTimeoutSeq IS NOT NULL
     BEGIN UPDATE purchase SET lastTimeoutSeq=NULL WHERE id=NEW.id; END''');
+}
+
+Future<void> _installV7(DatabaseExecutor db) async {
+  await db.execute('''CREATE INDEX IF NOT EXISTS recovery.linked_environment_source
+      ON observation(originPurchase,observedContext) WHERE originLinked=1''');
+  // Keep positive submission evidence after a replay updates its queue row.
+  // Older ledgers can prove the submission but cannot name a live object.
+  await db.execute('''CREATE TABLE IF NOT EXISTS recovery.legacy_payment_origin(
+      attemptId TEXT NOT NULL, reportedId TEXT NOT NULL, generation TEXT, objectKey TEXT,
+      PRIMARY KEY(attemptId,reportedId))''');
+  await db.rawInsert(
+      '''INSERT OR IGNORE INTO recovery.legacy_payment_origin(attemptId,reportedId)
+      SELECT a.id,q.reportedId FROM queue_item q JOIN attempt a ON a.id=q.attemptId
+      WHERE a.mode='legacy' AND a.legacySubmission='accepted' AND q.status='paid'
+        AND q.observation IS NULL AND q.reportedId IS NOT NULL AND q.originalId IS NULL
+        AND q.productId=a.productId AND q.token=a.wireToken''');
+  final proofColumns = await db
+      .rawQuery('PRAGMA recovery.table_info(verified_queue_transaction)');
+  if (!proofColumns.any((r) => r['name'] == 'opposingProof')) {
+    await db.execute(
+        'ALTER TABLE recovery.verified_queue_transaction ADD COLUMN opposingProof TEXT');
+  }
+  await db.execute('''CREATE TABLE IF NOT EXISTS recovery.removed_object(
+      generation TEXT NOT NULL, objectKey TEXT NOT NULL,
+      PRIMARY KEY(generation,objectKey))''');
+  final columns = await db.rawQuery('PRAGMA table_info(meta)');
+  if (!columns.any((r) => r['name'] == 'originalPaymentsRestored')) {
+    await db.execute(
+        'ALTER TABLE meta ADD COLUMN originalPaymentsRestored INTEGER NOT NULL DEFAULT 0');
+  }
 }
 
 Future<void> _quarantineCandidate(DatabaseExecutor db) async {

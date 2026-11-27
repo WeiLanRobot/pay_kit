@@ -7,6 +7,7 @@ import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
 
 import 'apple_journal.dart';
+import 'apple_disposition_facts.dart';
 import 'apple_models.dart';
 import 'apple_store.dart';
 
@@ -141,6 +142,9 @@ class ApplePayments {
   final _timers = <String, Timer>{};
   final _delays = <String, int>{};
   final _unwritten = <StoreEvent>{};
+  // A failed SQLite write must not restore liveness to a removed native object.
+  final _removingHandles = <String>{};
+  final _purchasesAwaitingUniqueObject = <String, String>{};
   // A native result may outlive a failed disk write. Retain its exact transition.
   final _launchResults = <String, String>{};
   Future<void> _events = Future.value();
@@ -212,7 +216,8 @@ class ApplePayments {
         throw StateError(
             'Legacy payment work in progress; retry managed startup');
       }
-      await _journal.select(app, environment, handoff: _submittedHere);
+      await _journal.select(app, environment,
+          handoff: _submittedHere, restorePayments: _restoreOriginalPayments);
       _configured = true;
     } finally {
       if (upgrading) _drainBuffer();
@@ -256,7 +261,8 @@ class ApplePayments {
         store is AppleStoreLifecycle ? store as AppleStoreLifecycle : null;
     bool registrationAttempted = false;
     try {
-      await _journal.select(app, environment);
+      await _journal.select(app, environment,
+          restorePayments: _restoreOriginalPayments);
       if (_closed) throw StateError('Apple payments closed');
       _buffer = [];
       _subscription = store.events.listen((batch) {
@@ -494,26 +500,30 @@ class ApplePayments {
               AND (mode='legacy' OR wireToken=id COLLATE NOCASE)
               ORDER BY rowid DESC LIMIT 1""", [scope, order]);
       final prior = rows.firstOrNull;
+      if (_disagrees(prior?['productId'], product)) {
+        throw StateError('Order product changed');
+      }
       if (scope != null) {
         final charges = await db.query('purchase',
             columns: ['productId'],
             where: 'scope=? AND orderId=?',
             whereArgs: [scope, order]);
-        if (charges.any((charge) => charge['productId'] != product)) {
+        if (prior == null &&
+            charges.any((charge) => charge['productId'] != product)) {
           throw StateError('Order product changed');
         }
         // A server-confirmed order can predate this installation.
         if (charges.isNotEmpty) return (preparedId: null);
-        final dispute = await _disputedProduct(db, scope, order);
+        final dispute =
+            await _disputedProduct(db, scope, order, preferred: product);
         if (dispute != null) {
-          if (dispute != product) throw StateError('Order product changed');
+          if (prior == null && dispute != product) {
+            throw StateError('Order product changed');
+          }
           return (preparedId: null);
         }
       }
       if (prior != null) {
-        if (prior['productId'] != product) {
-          throw StateError('Order product changed');
-        }
         if (owner != null && !identical(_origin[prior['id']], owner)) {
           throw StateError('Original legacy receiver unavailable');
         }
@@ -565,7 +575,7 @@ class ApplePayments {
 
     final prior = await _journal.read(existing);
     if (prior != null && prior.preparedId == null) {
-      return (await _snapshot(scope, order))!;
+      return (await _snapshot(scope, order, preferredProduct: product))!;
     }
     await _store.prepare(product);
     final id = await _journal.write((db) async {
@@ -597,7 +607,9 @@ class ApplePayments {
       });
       return id;
     });
-    if (id == null) return (await _snapshot(scope, order))!;
+    if (id == null) {
+      return (await _snapshot(scope, order, preferredProduct: product))!;
+    }
     if (owner != null && _legacy.containsKey(owner)) _origin[id] = owner;
     _changed();
     final submit = await _journal.write((db) async {
@@ -653,7 +665,7 @@ class ApplePayments {
       await _saveLaunchResult(id, 'declined');
     }
     _changed();
-    return (await _snapshot(scope, order))!;
+    return (await _snapshot(scope, order, preferredProduct: product))!;
   }
 
   Future<void> _saveLaunchResult(String id, String phase) async {
@@ -728,6 +740,8 @@ class ApplePayments {
       pending.add(event);
       return;
     }
+    final handle = _handleKey(event);
+    if (event.removed && handle != null) _removingHandles.add(handle);
     _unwritten.add(event);
     _events = _events.then((_) async {
       if (_closed || !_unwritten.contains(event)) return;
@@ -862,6 +876,32 @@ class ApplePayments {
         claim, originalSubmission, verifiedQueueTransaction);
   }
 
+  /// Records a trusted server's payment or fulfillment decision even when this
+  /// installation has never seen the StoreKit transaction. This establishes
+  /// neither a device transaction alias nor a local purchase attempt.
+  Future<void> recordPayment(AppleClaim claim) async {
+    if (_configuration == null) {
+      throw StateError('Application identity required');
+    }
+    await _configuration;
+    if (!_ready ||
+        _closed ||
+        !_validClaim(claim) ||
+        claim.disposition != null &&
+            !_matchesClaim(claim, claim.disposition!)) {
+      throw StateError('Invalid Apple financial claim');
+    }
+    final affected = <String>{};
+    await _journal.write((db) async {
+      await _recordFinancialClaim(
+          db, claim, await _verifiedCharge(db, claim), affected);
+    });
+    _changed();
+    for (final id in affected) {
+      _schedule(id);
+    }
+  }
+
   Future<void> reconcile(AppleClaim claim) async {
     if (_configuration == null) {
       throw StateError('Application identity required');
@@ -923,7 +963,9 @@ class ApplePayments {
         // An unresolved group conveys uncertainty. Its members retain separate
         // identities and are never consumed together by the delivery worker.
         final key = (
-          row['reportedId'] == null && row['conflict'] == 0
+          row['reportedId'] == null &&
+                  row['verifiedId'] == null &&
+                  row['conflict'] == 0
               ? null
               : row['id'] as String,
           row['productId'] as String,
@@ -939,6 +981,9 @@ class ApplePayments {
           final receipts = await db.rawQuery('''
             SELECT body FROM evidence JOIN purchase_evidence ON evidence.hash=purchase_evidence.hash
             WHERE purchaseId=? ORDER BY seq''', [member['id']]);
+          if (member['reportedId'] == null && member['verifiedId'] != null) {
+            continue;
+          }
           observations[member['id'] as String] =
               List.unmodifiable(receipts.map((r) => r['body'] as String));
         }
@@ -961,6 +1006,7 @@ class ApplePayments {
             id: row['id'] as String,
             productId: row['productId'] as String,
             transactionId: row['reportedId'] as String?,
+            verifiedTransactionId: row['verifiedId'] as String?,
             purchaseToken: row['token'] as String?,
             observations: Map.unmodifiable(observations),
             receipts:
@@ -975,23 +1021,34 @@ class ApplePayments {
   // A competing authenticated claim blocks another checkout without exposing
   // the other account's receipt, charge, or local attempt.
   Future<String?> _disputedProduct(
-      DatabaseExecutor db, String scope, String orderId) async {
+      DatabaseExecutor db, String scope, String orderId,
+      {String? preferred}) async {
     final rows = await db.rawQuery('''
-      SELECT a.productId FROM attempt a JOIN recovery.observation r
+      SELECT DISTINCT a.productId, NULL AS payload FROM attempt a JOIN recovery.observation r
         ON r.token=a.wireToken COLLATE NOCASE AND r.productId=a.productId
       WHERE a.mode='scoped' AND a.wireToken=a.id COLLATE NOCASE
         AND a.scope=? AND a.orderId=? AND r.status='paid'
         AND r.boundEnvironment IS NULL AND (r.actual IS NULL OR r.actual=?)
       UNION ALL
-      SELECT productId FROM purchase WHERE conflict=1 AND id IN (
-        SELECT purchaseId FROM claim_fact WHERE scope=? AND orderId=? AND covered=0
-        UNION SELECT purchaseId FROM disposition_fact WHERE scope=? AND orderId=? AND covered=0
-      ) LIMIT 1
+      SELECT NULL, f.payload FROM claim_fact f JOIN purchase p ON p.id=f.purchaseId
+        WHERE f.scope=? AND f.orderId=? AND f.covered=0 AND p.conflict=1
+      UNION ALL
+      SELECT NULL, f.payload FROM disposition_fact f JOIN purchase p ON p.id=f.purchaseId
+        WHERE f.scope=? AND f.orderId=? AND f.covered=0 AND p.conflict=1
     ''', [scope, orderId, _environment, scope, orderId, scope, orderId]);
-    return rows.firstOrNull?['productId'] as String?;
+    String? first;
+    for (final row in rows) {
+      // Both authenticated payload formats store the claimant's SKU at index 4.
+      final product = row['productId'] as String? ??
+          (jsonDecode(row['payload'] as String) as List)[4] as String;
+      if (preferred == null || product == preferred) return product;
+      first ??= product;
+    }
+    return first;
   }
 
-  Future<AppleOrderSnapshot?> _snapshot(String? scope, String orderId) =>
+  Future<AppleOrderSnapshot?> _snapshot(String? scope, String orderId,
+          {String? preferredProduct}) =>
       _journal.read((db) async {
         final attempts = await db.rawQuery(
             """SELECT * FROM attempt WHERE scope IS ? AND orderId=? AND submittedId IS NULL
@@ -1004,8 +1061,10 @@ class ApplePayments {
             FROM purchase p WHERE (p.scope IS ? AND p.orderId=?) OR
               (p.scope IS NULL AND p.attemptId=?) ORDER BY p.rowid
         ''', [scope, orderId, a?['id']]);
-        final dispute =
-            scope == null ? null : await _disputedProduct(db, scope, orderId);
+        final dispute = scope == null
+            ? null
+            : await _disputedProduct(db, scope, orderId,
+                preferred: preferredProduct);
         if (a == null && purchases.isEmpty && dispute == null) return null;
         if (a == null) {
           final linked =
@@ -1037,6 +1096,8 @@ class ApplePayments {
                 purchases.firstOrNull?['productId'] ??
                 dispute) as String,
             attemptId: a?['id'] as String?,
+            attemptPhase:
+                attemptPhase == 'submitting' ? 'uncertain' : attemptPhase,
             revision: revision,
             unpaidFinishPending: unpaid.isNotEmpty,
             phase: phase == 'submitting' ? 'uncertain' : phase,
@@ -1045,6 +1106,8 @@ class ApplePayments {
                 : a?['reason'] as String?,
             charges: List.unmodifiable(purchases.map((p) => AppleCharge(
                 transactionId: p['reportedId'] as String?,
+                verifiedTransactionId: p['verifiedId'] as String?,
+                attemptId: p['attemptId'] as String?,
                 disposition: p['disposition'] as String?,
                 reference: p['ackRef'] as String?,
                 finishPending: p['finishPending'] == 1,
@@ -1077,13 +1140,17 @@ class ApplePayments {
         final value = s == null
             ? null
             : jsonEncode([
+                s.productId,
                 s.attemptId,
+                s.attemptPhase,
                 s.phase,
                 s.reason,
                 s.unpaidFinishPending,
                 for (final c in s.charges)
                   [
                     c.transactionId,
+                    c.verifiedTransactionId,
+                    c.attemptId,
                     c.disposition,
                     c.reference,
                     c.finishPending,

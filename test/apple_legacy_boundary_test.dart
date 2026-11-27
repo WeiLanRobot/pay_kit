@@ -135,9 +135,11 @@ void main() {
         verifiedTransactionId: 'old-charge',
         reference: 'verified-on-server'));
     await payments.settle();
-    expect((await account.lookup('legacy-order'))!.charges.single.disposition,
-        'delivered');
-    expect(store.finished.single.transactionId, 'old-charge');
+    final charge = (await account.lookup('legacy-order'))!.charges.single;
+    expect(charge.verifiedTransactionId, 'old-charge');
+    expect(charge.attemptId, isNull);
+    expect(charge.transactionId, isNull);
+    expect(store.finished, isEmpty);
     expect(received, isEmpty);
   });
 

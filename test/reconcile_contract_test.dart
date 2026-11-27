@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pay_kit/pay_kit.dart';
 import 'package:pay_kit/src/iap/apple_journal.dart';
+import 'package:sqflite/sqflite.dart';
 
+import 'verified_queue_fixture.dart';
 import 'apple_payments_test.dart' show ProbeStore, delivered;
 
 void main() {
@@ -49,13 +52,14 @@ void main() {
           String? observationId,
           String? token,
           String order = 'O',
+          String product = 'sku',
           String transactionId = 'T'}) =>
       AppleClaim(
         appId: 'app',
         environment: 'sandbox',
         scope: scope,
         orderId: order,
-        productId: 'sku',
+        productId: product,
         reportedTransactionId: transactionId,
         verifiedTransactionId: transactionId,
         reference: reference,
@@ -67,26 +71,29 @@ void main() {
 
   AppleDisposition receipt(String scope, String ref,
           {AppleOutcome outcome = AppleOutcome.delivered,
-          String? supersedes}) =>
+          String order = 'O',
+          String? supersedes,
+          String? operation}) =>
       AppleDisposition(
         appId: 'app',
         environment: 'sandbox',
         scope: scope,
-        orderId: 'O',
+        orderId: order,
         productId: 'sku',
         reportedTransactionId: 'T',
         verifiedTransactionId: 'T',
         reference: ref,
         supersedes: supersedes,
+        fulfillmentOperationId: operation,
         outcome: outcome,
       );
 
   Future<AppleClaim> observe() async {
-    store.event(null, 'T');
+    store.event(null, 'T', handle: 'object-T');
     await payments.settle();
     final orphan = (await payments.unmatched()).single;
     final c = claim('A', observationId: orphan.id);
-    await payments.reconcile(c);
+    await proveQueue(payments, c);
     await payments.settle();
     return c;
   }
@@ -106,6 +113,21 @@ void main() {
           reference: 'account-and-charge-evidence',
           coveredReceipts: covers,
           finalDisposition: finalAck);
+
+  test('an existing checkout retains its own SKU during an ownership dispute',
+      () async {
+    final b = login('B');
+    await b.buy(orderId: 'O', productId: 'original');
+    await payments.recordPayment(claim('A'));
+    await payments.recordPayment(claim('B', product: 'claimed'));
+    expect((await b.lookup('O'))!.productId, 'original');
+    await expectLater(
+        b.buy(orderId: 'O', productId: 'claimed'), throwsStateError);
+    final held = await b.buy(orderId: 'O', productId: 'original');
+    expect(held.productId, 'original');
+    expect(held.phase, 'conflict');
+    expect(store.submitted, hasLength(1));
+  });
 
   for (final conflictFirst in [true, false]) {
     test(
@@ -154,9 +176,9 @@ void main() {
       'moving the primary charge revalidates the remaining charge in the same login',
       () async {
     for (final tx in ['T', 'T2']) {
-      store.event(null, tx);
+      store.event(null, tx, handle: 'object-$tx');
       await payments.settle();
-      await payments.reconcile(claim('A', transactionId: tx));
+      await proveQueue(payments, claim('A', transactionId: tx));
     }
     final flags = <bool>[];
     final a = payments.connect(
@@ -199,7 +221,8 @@ void main() {
     await payments.settle();
     expect(verified.single.scope, 'B');
     expect((await b.lookup('O'))!.attemptId, isNull);
-    expect(store.finished.map((e) => e.transactionId), ['T']);
+    // The existing object proof names the old owner.
+    expect(store.finished, isEmpty);
     await stop();
     await boot();
     await payments.reconcile(first);
@@ -243,6 +266,86 @@ void main() {
         payments.reconcile(claim('A', review: review(d))), throwsStateError);
     expect((await dispute()).reason, 'reviewDecisionConflict');
     expect(store.finished, hasLength(1));
+  });
+
+  for (final (scope, order) in [('B', 'O'), ('A', 'other-order')]) {
+    test(
+        'moving a fulfilled charge to $scope/$order compensates every delivery',
+        () async {
+      final first = claim('A', disposition: receipt('A', 'first'));
+      await payments.recordPayment(first);
+      await payments
+          .recordPayment(claim('A', disposition: receipt('A', 'second')));
+      await payments.recordPayment(claim(scope, order: order));
+      final d = await dispute();
+      expect(d.receiptReferences.toSet(), {'first', 'second'});
+      AppleClaim ruling(AppleOutcome outcome, List<String> covers) =>
+          claim(scope,
+              order: order,
+              review: review(d,
+                  covers: covers,
+                  finalAck: receipt(scope, 'settlement',
+                      order: order, outcome: outcome)));
+      await expectLater(
+          payments.recordPayment(
+              ruling(AppleOutcome.delivered, d.receiptReferences)),
+          throwsStateError);
+      await expectLater(
+          payments.recordPayment(ruling(AppleOutcome.refunded, ['first'])),
+          throwsStateError);
+      expect((await dispute()).disputeRevision, d.disputeRevision);
+      await payments
+          .recordPayment(ruling(AppleOutcome.refunded, d.receiptReferences));
+      await stop();
+      await boot();
+      await payments.recordPayment(first);
+      expect(await login('A').lookup('O'), isNull);
+      final corrected = await login(scope).lookup(order);
+      expect(corrected!.charges.single.disposition, 'refunded');
+      expect(corrected.charges.single.conflict, isFalse);
+      await payments.recordPayment(claim('C'));
+      expect((await dispute()).receiptReferences.toSet(),
+          {'first', 'second', 'settlement'});
+    });
+  }
+
+  test('recordPayment wakes the linked queue item after a financial review',
+      () async {
+    await observe();
+    await payments.recordPayment(claim('B'));
+    await payments.settle();
+    expect(store.finished, isEmpty);
+    final d = await dispute();
+    final ruling =
+        claim('A', review: review(d, finalAck: receipt('A', 'shipment')));
+    await payments.recordPayment(ruling);
+    await payments.settle();
+    expect(store.finished.map((e) => e.transactionId), ['T']);
+    await payments.recordPayment(ruling);
+    await payments.settle();
+    expect(store.finished, hasLength(1));
+  });
+
+  test('a competing account sees and blocks only its own claimed products',
+      () async {
+    await payments.recordPayment(claim('A'));
+    await payments.recordPayment(claim('B', order: 'other', product: 'coins'));
+    final b = login('B');
+    final own = (await b.lookup('other'))!;
+    expect(own.productId, 'coins');
+    expect(own.charges, isEmpty);
+    expect(own.attemptId, isNull);
+    await payments.recordPayment(claim('B', order: 'other', product: 'gems'));
+    for (final product in ['coins', 'gems']) {
+      final held = await b.buy(orderId: 'other', productId: product);
+      expect(held.productId, product);
+      expect(held.phase, 'conflict');
+      expect(held.charges, isEmpty);
+    }
+    await expectLater(
+        b.buy(orderId: 'other', productId: 'sku'), throwsStateError);
+    expect(store.submitted, isEmpty);
+    expect(await login('C').lookup('other'), isNull);
   });
 
   for (final refundFirst in [true, false]) {
@@ -296,6 +399,273 @@ void main() {
     expect(verified, isEmpty);
   });
 
+  for (final order in ['abr', 'arb', 'bar', 'bra', 'rab', 'rba']) {
+    test('authenticated delivery aliases share one refund in order $order',
+        () async {
+      await observe();
+      final aliases = {
+        'a': receipt('A', 'shipping-a', operation: 'grant-01'),
+        'b': receipt('A', 'shipping-b', operation: 'grant-01'),
+        'r': receipt('A', 'refund',
+            outcome: AppleOutcome.refunded, supersedes: 'shipping-a'),
+      };
+      for (final symbol in order.split('')) {
+        final response =
+            payments.reconcile(claim('A', disposition: aliases[symbol]));
+        if (symbol == 'r' && order.indexOf('a') > order.indexOf('r') ||
+            symbol == 'b' && order.startsWith('rb')) {
+          await expectLater(response, throwsStateError);
+        } else {
+          await response;
+        }
+      }
+      final charge = (await login('A').lookup('O'))!.charges.single;
+      expect(charge.disposition, 'refunded');
+      expect(charge.conflict, isFalse);
+    });
+  }
+
+  test('separate reference and fulfillment ID namespaces require two refunds',
+      () async {
+    await observe();
+    await payments.reconcile(claim('A', disposition: receipt('A', 'one')));
+    await payments.reconcile(
+        claim('A', disposition: receipt('A', 'two', operation: 'one')));
+    final refundOne = claim('A',
+        disposition: receipt('A', 'r1',
+            outcome: AppleOutcome.refunded, supersedes: 'one'));
+    await expectLater(payments.reconcile(refundOne), throwsStateError);
+    expect((await dispute()).reason, 'incompleteRefundCoverage');
+    await expectLater(payments.reconcile(refundOne), throwsStateError);
+    await payments.reconcile(claim('A',
+        disposition: receipt('A', 'r2',
+            outcome: AppleOutcome.refunded, supersedes: 'two')));
+    final charge = (await login('A').lookup('O'))!.charges.single;
+    expect(charge.disposition, 'refunded');
+    expect(charge.conflict, isFalse);
+  });
+
+  test(
+      'reused receipt reference with a different operation needs a formal review',
+      () async {
+    await observe();
+    final first = receipt('A', 'sale', operation: 'grant-a');
+    final second = receipt('A', 'sale', operation: 'grant-b');
+    await payments.reconcile(claim('A', disposition: first));
+    await expectLater(
+        payments.reconcile(claim('A', disposition: second)), throwsStateError);
+    final d = await dispute();
+    expect(d.reason, 'dispositionConflict');
+    final decision =
+        claim('A', review: review(d, covers: ['sale'], finalAck: first));
+    await payments.reconcile(decision);
+    await stop();
+    await boot();
+    await payments.reconcile(decision);
+    await payments.reconcile(claim('A', disposition: second));
+    await payments.reconcile(claim('A',
+        disposition: receipt('A', 'second-ref', operation: 'grant-a')));
+    await payments.reconcile(claim('A',
+        disposition: receipt('A', 'refund',
+            outcome: AppleOutcome.refunded, supersedes: 'second-ref')));
+    final charge = (await login('A').lookup('O'))!.charges.single;
+    expect(charge.conflict, isFalse);
+    expect(charge.disposition, 'refunded');
+  });
+
+  test(
+      'v6 settled partial refund becomes a dispute and retains observed removal',
+      () async {
+    await observe();
+    await payments.reconcile(claim('A', disposition: receipt('A', 'a')));
+    await payments.settle();
+    await payments.reconcile(claim('A', disposition: receipt('A', 'b')));
+    await expectLater(
+        payments.reconcile(claim('A',
+            disposition: receipt('A', 'r',
+                outcome: AppleOutcome.refunded, supersedes: 'a'))),
+        throwsStateError);
+    await stop();
+    // Reconstruct the old reducer's materialized state; receipt payloads use
+    // the unchanged v6 representation. Preserve the real queue history.
+    final db = await openDatabase('${dir.path}/ledger');
+    final id = (await db.query('purchase')).single['id'];
+    await db.insert('purchase_amendment', {'purchaseId': id});
+    await db.update('purchase', {
+      'disposition': 'refunded',
+      'ackRef': 'r',
+      'reason': null,
+      'conflict': 0,
+      'disputeRevision': 0
+    });
+    await db.delete('purchase_amendment');
+    await db.delete('conflict_fact');
+    final finished = (await db.query('queue_item')).single['finished'];
+    await db.setVersion(6);
+    await db.close();
+    await boot();
+    final d = await dispute();
+    expect(d.reason, 'incompleteRefundCoverage');
+    expect(d.disputeRevision, 1);
+    expect(d.receiptReferences.toSet(), {'a', 'b', 'r'});
+    expect(store.finished, isEmpty);
+    await stop();
+    final upgraded = await openDatabase('${dir.path}/ledger');
+    expect((await upgraded.query('queue_item')).single['finished'], finished);
+    await upgraded.close();
+    await boot();
+    expect((await dispute()).disputeRevision, 1);
+    await payments.reconcile(claim('A',
+        disposition: receipt('A', 'refund-b',
+            outcome: AppleOutcome.refunded, supersedes: 'b')));
+    expect((await login('A').lookup('O'))!.charges.single.conflict, isFalse);
+  });
+
+  test('an uncompensated v6 transfer needs a refund even after another claim',
+      () async {
+    await observe();
+    login('A');
+    await payments.settle();
+    await payments.recordPayment(claim('B'));
+    final before = await dispute();
+    await payments.recordPayment(claim('B',
+        review: review(before,
+            covers: before.receiptReferences,
+            finalAck: receipt('B', 'ruling', outcome: AppleOutcome.refunded))));
+    await stop();
+
+    // v6 also allowed an ownership review to select another delivered receipt.
+    final db = await openDatabase('${dir.path}/ledger');
+    final fact = (await db.query('disposition_fact',
+            where: 'reference=?', whereArgs: ['ruling']))
+        .single;
+    final payload = jsonDecode(fact['payload'] as String) as List;
+    payload[9] = 'delivered';
+    final finalReceipt = jsonEncode(payload);
+    final reviewRow = (await db.query('dispute_review')).single;
+    final reviewPayload = jsonDecode(reviewRow['payload'] as String) as List;
+    reviewPayload[5] = finalReceipt;
+    await db.update('dispute_review', {'payload': jsonEncode(reviewPayload)});
+    await db.update('disposition_fact',
+        {'payload': finalReceipt, 'outcome': 'delivered', 'covered': 1},
+        where: 'reference=?', whereArgs: ['ruling']);
+    await db.insert('purchase_amendment', {'purchaseId': before.disputeId});
+    await db.update('purchase', {'disposition': 'delivered'});
+    await db.delete('purchase_amendment');
+    await db.setVersion(6);
+    await db.close();
+
+    await boot();
+    final upgraded = await dispute();
+    expect(upgraded.reason, 'uncompensatedOwnershipChange');
+    final b = login('B');
+    expect((await b.lookup('O'))!.charges.single.finishPending, isFalse);
+    await payments.recordPayment(claim('C'));
+    final latest = await dispute();
+    AppleClaim decide(AppleOutcome outcome) => claim('B',
+        review: review(latest,
+            decision: 'repair',
+            covers: latest.receiptReferences,
+            finalAck: receipt('B', 'replacement', outcome: outcome)));
+    await expectLater(payments.recordPayment(decide(AppleOutcome.delivered)),
+        throwsStateError);
+    await payments.recordPayment(decide(AppleOutcome.refunded));
+    final repaired = (await b.lookup('O'))!.charges.single;
+    expect(repaired.disposition, 'refunded');
+    expect(repaired.conflict, isFalse);
+    expect(repaired.finishPending, isFalse);
+    expect(store.finished, isEmpty);
+  });
+
+  test('v6 formal compensation remains effective across upgrade and replay',
+      () async {
+    await observe();
+    final sale = receipt('A', 'sale');
+    final refund = receipt('A', 'refund', outcome: AppleOutcome.refunded);
+    await payments.reconcile(claim('A', disposition: sale));
+    await expectLater(
+        payments.reconcile(claim('A', disposition: refund)), throwsStateError);
+    final d = await dispute();
+    final reviewed = claim('A',
+        review: review(d, covers: d.receiptReferences, finalAck: refund));
+    await payments.reconcile(reviewed);
+    await stop();
+    final db = await openDatabase('${dir.path}/ledger');
+    await db.update('disposition_fact', {'covered': 1});
+    await db.setVersion(6);
+    await db.close();
+    await boot();
+    await payments.reconcile(reviewed);
+    await payments.reconcile(claim('A', disposition: sale));
+    final charge = (await login('A').lookup('O'))!.charges.single;
+    expect(charge.disposition, 'refunded');
+    expect(charge.conflict, isFalse);
+    await expectLater(
+        payments.reconcile(claim('A', disposition: receipt('A', 'new grant'))),
+        throwsStateError);
+    expect((await dispute()).reason, 'incompleteRefundCoverage');
+  });
+
+  test('v7 upgrade rolls back receipt projection and removal table together',
+      () async {
+    await observe();
+    final refund = receipt('A', 'refund', outcome: AppleOutcome.refunded);
+    await payments.reconcile(claim('A', disposition: refund));
+    await stop();
+    final file = File('${dir.path}/ledger');
+    final db = await openDatabase(file.path);
+    final original = (await db.query('disposition_fact')).single['payload'];
+    await db.update('disposition_fact', {'payload': 'invalid'});
+    await db.setVersion(6);
+    await db.close();
+    final side = await openDatabase('${file.path}.observations');
+    await side.execute('DROP TABLE removed_object');
+    await side.close();
+    final journal = AppleJournal(() async => file);
+    await expectLater(
+        journal.select('app', 'sandbox'), throwsA(isA<FormatException>()));
+    await journal.close();
+    final old = await openDatabase(file.path);
+    expect(await old.getVersion(), 6);
+    expect((await old.query('purchase')).single['conflict'], 0);
+    await old.update('disposition_fact', {'payload': original});
+    await old.close();
+    final sideAfter = await openDatabase('${file.path}.observations');
+    expect(
+        await sideAfter.rawQuery(
+            "SELECT 1 FROM sqlite_master WHERE name='removed_object'"),
+        isEmpty);
+    await sideAfter.close();
+    await boot();
+    expect((await login('A').lookup('O'))!.charges.single.conflict, isFalse);
+  });
+
+  test(
+      'an ownership claim cannot mask a pending disposition disagreement during review',
+      () async {
+    await observe();
+    final first = receipt('A', 'sale', operation: 'grant-a');
+    await payments.reconcile(claim('A', disposition: first));
+    await expectLater(
+        payments.reconcile(claim('A',
+            disposition: receipt('A', 'sale', operation: 'grant-b'))),
+        throwsStateError);
+    await expectLater(payments.reconcile(claim('B')), throwsStateError);
+    final d = await dispute();
+    expect(d.reason, 'ownershipConflict');
+    await expectLater(
+        payments.reconcile(claim('A', review: review(d))), throwsStateError);
+    final invalid = receipt('A', 'invalid',
+        outcome: AppleOutcome.refunded, supersedes: 'unknown');
+    await expectLater(
+        payments.reconcile(
+            claim('A', review: review(d, covers: ['sale'], finalAck: invalid))),
+        throwsStateError);
+    await payments.reconcile(
+        claim('A', review: review(d, covers: ['sale'], finalAck: first)));
+    expect((await login('A').lookup('O'))!.charges.single.conflict, isFalse);
+  });
+
   test('corrected ownership detaches the real attempt across native replay',
       () async {
     final a = login('A');
@@ -341,7 +711,7 @@ void main() {
     await payments.buyLegacy(owner, 'sku', wire);
     final a = (await payments.unresolvedAttempts()).single;
     expect(a.attemptId, isNot(wire));
-    store.event(null, 'T');
+    store.event(null, 'T', handle: 'tokenless');
     await payments.settle();
     final observation = (await payments.unmatched()).single;
     final c =
@@ -358,6 +728,11 @@ void main() {
         claim: c,
         outcome: AppleAttemptOutcome.paid));
     login('A');
+    await payments.settle();
+    expect(store.finished, isEmpty);
+    store.event(wire, 'T', handle: 'tokenless');
+    await payments.settle();
+    await payments.reconcile(c);
     await payments.settle();
     expect(verified.single.attemptId, a.attemptId);
     expect(verified.single.purchaseToken, wire);
@@ -377,7 +752,7 @@ void main() {
       }, (_, __) {}, (_) {});
       await payments.buyLegacy(owner, 'sku', 'O');
       final attempt = (await payments.unresolvedAttempts()).single;
-      store.event(null, 'T');
+      store.event(null, 'T', handle: 'replayed');
       await payments.settle();
       final orphan = (await payments.unmatched()).single;
       final c = claim('A', observationId: orphan.id);
@@ -408,7 +783,7 @@ void main() {
             payments.buyLegacy(owner, 'other', 'next'), throwsA(anything));
       }
       await payments.resolveAttempt(decision('server-proof'));
-      await payments.reconcile(c);
+      await proveQueue(payments, c);
       await payments.resolveAttempt(decision('server-proof'));
       await payments.settle();
       final paid = (await a.lookup('O'))!;
@@ -469,10 +844,14 @@ void main() {
             verifiedTransactionId: 'V',
             reference: 'claim-$scope-$reported',
             review: ruling);
-    store.event(null, 'T1');
+    final owner = Object();
+    payments.attachLegacy(owner, (_) async {}, (_, __) {}, (_) {});
+    await payments.buyLegacy(owner, 'sku', 'O');
+    payments.detachLegacy(owner);
+    store.event('O', 'T1');
     await payments.settle();
     await payments.reconcile(alias('A', 'T1'));
-    store.event(null, 'T2');
+    store.event('O', 'T2');
     await payments.settle();
     await expectLater(payments.reconcile(alias('B', 'T2')), throwsStateError);
     final d = await dispute();
@@ -504,13 +883,43 @@ void main() {
             reportedTransactionId: reported,
             verifiedTransactionId: 'V',
             reference: 'server-$reported',
+            purchaseToken: reported == 'T1' ? original : different,
             review: ruling);
+    Future<void> attest(String owner, String token, String reported) async {
+      final observation = (await payments.unmatched())
+          .singleWhere((item) => item.transactionId == reported);
+      final claim = AppleClaim(
+          appId: 'app',
+          environment: 'sandbox',
+          scope: owner,
+          orderId: 'O',
+          productId: 'sku',
+          reportedTransactionId: reported,
+          verifiedTransactionId: 'V',
+          purchaseToken: token,
+          reference: 'server-$reported',
+          observationId: observation.id);
+      await payments.recoverObservation(claim,
+          originalSubmission: AppleOriginalSubmission(
+              issuer: 'trusted-server',
+              reference: 'original-$reported',
+              appId: 'app',
+              environment: 'sandbox',
+              scope: owner,
+              orderId: 'O',
+              productId: 'sku',
+              quantity: 1,
+              reportedTransactionId: reported,
+              verifiedTransactionId: 'V',
+              purchaseToken: token));
+    }
+
     store.event(original, 'T1');
     await payments.settle();
-    await payments.reconcile(alias('A', 'T1'));
+    await attest('A', original, 'T1');
     store.event(different, 'T2');
     await payments.settle();
-    await expectLater(payments.reconcile(alias('B', 'T2')), throwsStateError);
+    await attest('B', different, 'T2');
     final d = await dispute();
     await expectLater(payments.reconcile(alias('B', 'T2', ruling: review(d))),
         throwsStateError);

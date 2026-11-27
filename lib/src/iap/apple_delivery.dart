@@ -106,12 +106,12 @@ const _boundToEvidenceCharge =
     (SELECT id FROM purchase_redirect WHERE purchaseId=x.purchaseId))''';
 const _canDeliverEvidence = '''(
   NOT EXISTS(SELECT 1 FROM recovery.observation o
-    WHERE o.reason='originalSubmissionConflict' AND $_boundToEvidenceCharge)
+    WHERE o.reason IN ('originalSubmissionConflict','queueProofConflict') AND $_boundToEvidenceCharge)
   OR EXISTS(SELECT 1 FROM recovery.candidate c
     JOIN recovery.observation o ON o.id=c.observation
     WHERE c.hash=x.hash AND $_boundToEvidenceCharge AND o.status='paid'
       AND (o.generation NOT IN ('verified','candidate','compatibility') OR o.originLinked=1)
-      AND (o.reason IS NULL OR o.reason NOT IN ('originalSubmissionConflict','identityConflict',
+      AND (o.reason IS NULL OR o.reason NOT IN ('originalSubmissionConflict','queueProofConflict','identityConflict',
           'environmentConflict','environmentRejected','compatibilityTransferred')))
 )''';
 
@@ -302,6 +302,11 @@ Future<void> _closeSettledAttempt(
       [purchaseId]);
 }
 
+bool _validFulfillmentOperation(AppleDisposition a) =>
+    a.fulfillmentOperationId == null ||
+    a.outcome == AppleOutcome.delivered &&
+        a.fulfillmentOperationId!.trim().isNotEmpty;
+
 String _ackPayload(AppleDisposition a) => jsonEncode([
       a.appId,
       a.environment,
@@ -313,7 +318,8 @@ String _ackPayload(AppleDisposition a) => jsonEncode([
       a.verifiedTransactionId,
       a.reference,
       a.outcome.name,
-      a.supersedes
+      a.supersedes,
+      if (a.fulfillmentOperationId != null) a.fulfillmentOperationId
     ]);
 
 String _claimPayload(AppleClaim c) => jsonEncode([
@@ -394,6 +400,7 @@ typedef _Removal = ({
   StoreEvent event,
   String? purchase,
   String? unbound,
+  bool exact,
 });
 
 extension _AppleDelivery on ApplePayments {
@@ -424,6 +431,22 @@ extension _AppleDelivery on ApplePayments {
 
   Future<void> _ingest(StoreEvent e) async {
     if (!_ready || _closed) return;
+    if (e.removed) {
+      // Keep an earlier failed receipt write ahead of its removal on retry.
+      if (_unwritten.takeWhile((prior) => !identical(prior, e)).any(
+          (prior) => !prior.removed && _handleKey(prior) == _handleKey(e))) {
+        throw StateError('StoreKit observation still requires persistence');
+      }
+      return _observeRemoval(e);
+    }
+    final handle = _handleKey(e);
+    if (handle != null &&
+        await _journal.read((db) async => (await db.rawQuery(
+                'SELECT 1 FROM recovery.removed_object WHERE generation=? AND objectKey=?',
+                [_generation, handle]))
+            .isNotEmpty)) {
+      return;
+    }
     final tokenOnFailure = _wire(e.token);
     if ((e.status == StoreStatus.canceled || e.status == StoreStatus.failed) &&
         tokenOnFailure != null &&
@@ -635,6 +658,16 @@ extension _AppleDelivery on ApplePayments {
               db, p?['scope'] as String? ?? a?['scope'] as String?, order, id);
         }
       }
+      if (!inconsistent &&
+          reported != null &&
+          e.originalTransactionId == null &&
+          a?['mode'] == 'legacy' &&
+          _submittedHere.contains(a?['id'])) {
+        await db.rawInsert(
+            '''INSERT OR IGNORE INTO recovery.legacy_payment_origin
+            (attemptId,reportedId,generation,objectKey) VALUES(?,?,?,?)''',
+            [a!['id'], reported, _generation, _objectKey(e)]);
+      }
       return (
         key: key,
         id: id,
@@ -836,7 +869,7 @@ extension _AppleDelivery on ApplePayments {
   Future<void> _finishRecorded(String key, StoreEvent e, String? id) async {
     String? observation;
     var requiresExactObject = false;
-    final permitted = await _journal.write((db) async {
+    final permitted = await _journal.recover((db, sources) async {
       final q = await _row(db, 'queue_item', key);
       if (q == null || q['finished'] == 1 || q['status'] != e.status.name) {
         return false;
@@ -865,22 +898,24 @@ extension _AppleDelivery on ApplePayments {
           p['id'] != id ||
           q['purchaseId'] != id ||
           p['disposition'] == null ||
-          _chargeOnHold(p)) {
+          _chargeOnHold(p) ||
+          await _hasForeignSource(db, id)) {
         return false;
       }
       String? handoff;
       if (p['disposition'] == 'legacyHandedOff') {
-        final records = await db.query('legacy_handoff',
-            columns: ['hash'],
-            where: 'purchaseId=? AND attemptId=?',
-            whereArgs: [id, p['attemptId']]);
+        final records = await db.rawQuery('''SELECT h.hash FROM legacy_handoff h
+            JOIN recovery.legacy_payment_origin o ON o.attemptId=h.attemptId
+            WHERE h.purchaseId=? AND h.attemptId=? AND o.reportedId=?
+              AND o.generation=? AND o.objectKey=?''',
+            [id, p['attemptId'], reported, _generation, _objectKey(e)]);
         handoff = records.firstOrNull?['hash'] as String?;
         if (handoff == null) return false;
       } else if (p['ackRef'] == null || p['verifiedId'] == null) {
         return false;
       }
       final disputedSource = await db.rawQuery(
-          """SELECT 1 FROM recovery.observation WHERE reason='originalSubmissionConflict'
+          """SELECT 1 FROM recovery.observation WHERE reason IN ('originalSubmissionConflict','queueProofConflict')
           AND (id=? OR (generation=? AND objectKey=?)) LIMIT 1""",
           [observation, _generation, _objectKey(e)]);
       if (disputedSource.isNotEmpty) return false;
@@ -891,7 +926,9 @@ extension _AppleDelivery on ApplePayments {
         if (proofs.isNotEmpty) {
           requiresExactObject = true;
           final proof = proofs.single;
-          if (proof['generation'] != _generation ||
+          if (!const {'delivered', 'refunded'}.contains(p['disposition']) ||
+              p['ackRef'] == null ||
+              proof['generation'] != _generation ||
               proof['objectKey'] != _objectKey(e) ||
               proof['appId'] != p['appId'] ||
               proof['environment'] != _environment ||
@@ -902,17 +939,13 @@ extension _AppleDelivery on ApplePayments {
               proof['transactionId'] != p['verifiedId'] ||
               proof['scope'] != p['scope'] ||
               proof['orderId'] != p['orderId'] ||
-              _disagrees(p['token'], proof['orderId']) ||
               proof['productId'] != p['productId'] ||
               !e.allowsUnownedFinish ||
-              !_onlyLiveQueueObject(e) ||
-              await _legacyQueueHistoryConflicts(db, proof)) {
+              !_canFinishUniqueObject(e, id)) {
             return false;
           }
-          // The journal holds the app-wide writer lock. Only the active
-          // partition and the shared reservation can change before this retry.
           final submission =
-              await _inspectLegacySubmission(db, proof, ['main']);
+              await _inspectQueueSubmission(db, proof, p, sources);
           if (submission.conflict ||
               submission.attempt?['id'] != p['attemptId'] ||
               submission.attempt != null &&
@@ -924,31 +957,124 @@ extension _AppleDelivery on ApplePayments {
       await _recordFinishAuthority(db, e,
           itemId: key, purchase: p, handoff: handoff);
       return true;
-    });
+    }, queueItemId: key);
     final current = _live[key] ?? _currentUnbound[observation];
     if (!permitted ||
         !_ready ||
         _closed ||
         current == null ||
-        requiresExactObject && !_onlyLiveQueueObject(current)) {
+        requiresExactObject && !_canFinishUniqueObject(current, id!)) {
       return;
     }
     if (!_sameFinishObject(current, e)) {
       throw StateError('StoreKit finish observation changed');
     }
     try {
-      if (current.needsFinish) await _store.finish(current);
+      if (current.needsFinish) {
+        await _store.finish(current, verifiedQueue: requiresExactObject);
+      }
     } catch (_) {
       await _journal.write((db) => db.update(
           'queue_item', {'reason': 'finishRetry'},
-          where: 'id=?', whereArgs: [key]));
+          where: 'id=? AND finished=0', whereArgs: [key]));
       _changed();
       if (id != null) _retryLater(id);
       throw StateError('StoreKit finish requires retry');
     }
-    await _rememberRemoval(
-        (key: key, event: current, purchase: id, unbound: null));
+    await _rememberRemoval((
+      key: key,
+      event: current,
+      purchase: id,
+      unbound: null,
+      exact: requiresExactObject
+    ));
   }
+
+  bool _canFinishUniqueObject(StoreEvent event, String purchaseId) {
+    if (_onlyLiveQueueObject(event)) return true;
+    _purchasesAwaitingUniqueObject[event.transactionId!] = purchaseId;
+    return false;
+  }
+
+  void _retryAfterObjectRemoval(StoreEvent event) {
+    for (final id in {event.transactionId, event.queueId}) {
+      final purchase = _purchasesAwaitingUniqueObject.remove(id);
+      if (purchase != null) _schedule(purchase);
+    }
+  }
+
+  /// An independent StoreKit notification also arrives for external removals and
+  /// after a finish call timed out. Retire this object even if its charge is now
+  /// disputed. Only exact local bindings can update an existing queue item.
+  Future<void> _observeRemoval(StoreEvent event) async {
+    final object = _handleKey(event);
+    if (object == null) throw StateError('Missing removed StoreKit handle');
+    await _journal.write((db) async {
+      await _recordRemovedObject(db, object);
+      final observations = await db.rawQuery(
+          'SELECT id FROM recovery.observation WHERE generation=? AND objectKey=?',
+          [_generation, object]);
+      final observation = observations.firstOrNull?['id'] as String?;
+      final authorities = await db.rawQuery(
+          'SELECT itemId FROM recovery.finish_authority WHERE generation=? AND objectKey=? AND environment=?',
+          [_generation, object, _configured ? _environment : 'compat']);
+      final keys = {
+        for (final entry in _live.entries)
+          if (_handleKey(entry.value) == object) entry.key,
+        for (final row in authorities)
+          _handleAliases[row['itemId']] ?? row['itemId'] as String,
+        if (observation != null)
+          for (final row in await db.query('queue_item',
+              columns: ['id'],
+              where: 'observation=?',
+              whereArgs: [observation]))
+            row['id'] as String,
+      };
+      for (final key in keys) {
+        final q = await _row(db, 'queue_item', key);
+        final live = _live[key];
+        if (q == null ||
+            q['observation'] != null && q['observation'] != observation ||
+            live != null && _handleKey(live) != object ||
+            !_removalMatches(q, event)) {
+          continue;
+        }
+        final changed = await db.rawUpdate(
+            'UPDATE queue_item SET finished=1,reason=NULL WHERE id=? AND finished=0',
+            [key]);
+        if (changed == 0 && q['finished'] != 1) {
+          throw StateError('StoreKit removal was not recorded');
+        }
+        if (q['purchaseId'] case final String purchase) {
+          await _discardCompletedEvidence(db, purchase);
+        }
+      }
+      if (observation != null) {
+        // An unclaimed payment retains its receipt for subsequent financial
+        // reconciliation. Removal conveys no environment, owner or disposition.
+        await db.rawUpdate(
+            "UPDATE recovery.observation SET finished=1 WHERE id=? AND (boundPurchase IS NOT NULL OR status IN ('canceled','failed'))",
+            [observation]);
+      }
+    });
+    _live.removeWhere((_, e) => _handleKey(e) == object);
+    _currentUnbound.removeWhere((_, e) => _handleKey(e) == object);
+    _observedHere.remove(object);
+    _removingHandles.remove(object);
+    _retryAfterObjectRemoval(event);
+    _changed();
+  }
+
+  Future<void> _recordRemovedObject(DatabaseExecutor db, String object) =>
+      db.rawInsert(
+          'INSERT OR IGNORE INTO recovery.removed_object(generation,objectKey) VALUES (?,?)',
+          [_generation, object]);
+
+  Future<void> _discardCompletedEvidence(DatabaseExecutor db, String id) =>
+      db.rawDelete('''DELETE FROM purchase_evidence WHERE purchaseId=? AND
+          EXISTS(SELECT 1 FROM purchase WHERE id=? AND disposition IS NOT NULL AND conflict=0)
+          AND NOT EXISTS(SELECT 1 FROM queue_item WHERE purchaseId=? AND finished=0)''',
+          [id, id, id]);
 
   Future<void> _rememberRemoval(_Removal removed) {
     _removedItems[removed.key] = removed;
@@ -963,6 +1089,9 @@ extension _AppleDelivery on ApplePayments {
     final e = removed.event;
     final object = _objectKey(e);
     final result = await _journal.write((db) async {
+      if (e.needsFinish && _handleKey(e) != null) {
+        await _recordRemovedObject(db, object);
+      }
       final key = _handleAliases[removed.key] ?? removed.key;
       final observations = <String>{};
       _Row? completedQueue;
@@ -979,14 +1108,7 @@ extension _AppleDelivery on ApplePayments {
             ? null
             : await _canonicalPurchaseId(db, removed.purchase!);
         final q = await _row(db, 'queue_item', key);
-        if (q == null ||
-            q['purchaseId'] != id ||
-            q['productId'] != e.productId ||
-            q['status'] != e.status.name ||
-            _disagrees(q['reportedId'], _present(e.transactionId)) ||
-            _disagrees(q['storeQueueId'], _present(e.queueId)) ||
-            _disagrees(q['originalId'], _present(e.originalTransactionId)) ||
-            _disagrees(q['token'], _wire(e.token))) {
+        if (q == null || q['purchaseId'] != id || !_removalMatches(q, e)) {
           throw StateError(
               'Removed StoreKit queue item has no verified journal target');
         }
@@ -1018,17 +1140,14 @@ extension _AppleDelivery on ApplePayments {
             final observation = row['id'] as String;
             final candidate = _currentUnbound[observation];
             if (row['objectKey'] == object ||
-                candidate != null &&
+                !removed.exact &&
+                    candidate != null &&
                     _matchesRemovedQueue(candidate, e, q,
                         boundObservation: observation == q['observation'])) {
               observations.add(observation);
             }
           }
-          await db.rawDelete(
-              '''DELETE FROM purchase_evidence WHERE purchaseId=? AND
-              EXISTS(SELECT 1 FROM purchase WHERE id=? AND disposition IS NOT NULL AND conflict=0)
-              AND NOT EXISTS(SELECT 1 FROM queue_item WHERE purchaseId=? AND finished=0)''',
-              [id, id, id]);
+          await _discardCompletedEvidence(db, id);
         }
       }
       for (final observation in observations) {
@@ -1055,6 +1174,7 @@ extension _AppleDelivery on ApplePayments {
     final live = _live[result.key];
     if (live != null &&
         result.queue != null &&
+        (!removed.exact || _objectKey(live) == object) &&
         _matchesRemovedQueue(live, e, result.queue!)) {
       _live.remove(result.key);
     }
@@ -1062,8 +1182,17 @@ extension _AppleDelivery on ApplePayments {
         removed.unbound == null ? 'unpaid/${removed.key}' : removed.key;
     _timers.remove(timerKey)?.cancel();
     _delays.remove(timerKey);
+    _retryAfterObjectRemoval(e);
     _changed();
   }
+
+  bool _removalMatches(_Row queue, StoreEvent event) =>
+      queue['productId'] == event.productId &&
+      queue['status'] == event.status.name &&
+      !_disagrees(queue['storeQueueId'], _present(event.queueId)) &&
+      !_disagrees(queue['reportedId'], _present(event.transactionId)) &&
+      !_disagrees(queue['originalId'], _present(event.originalTransactionId)) &&
+      !_disagrees(queue['token'], _wire(event.token));
 
   bool _matchesRemovedQueue(
       StoreEvent candidate, StoreEvent removed, _Row queue,
@@ -1074,13 +1203,7 @@ extension _AppleDelivery on ApplePayments {
     final linked = boundObservation &&
         candidate.queueId != null &&
         candidate.queueId == queue['storeQueueId'];
-    return (exact || alias || linked) &&
-        candidate.status.name == queue['status'] &&
-        candidate.productId == queue['productId'] &&
-        !_disagrees(queue['storeQueueId'], candidate.queueId) &&
-        !_disagrees(queue['reportedId'], candidate.transactionId) &&
-        !_disagrees(queue['originalId'], candidate.originalTransactionId) &&
-        !_disagrees(queue['token'], _wire(candidate.token));
+    return (exact || alias || linked) && _removalMatches(queue, candidate);
   }
 
   Future<void> _finishPurchase(String id) async {
@@ -1448,6 +1571,7 @@ extension _AppleDelivery on ApplePayments {
         if (ack.appId != _appId ||
             ack.environment != _environment ||
             ack.quantity != 1 ||
+            !_validFulfillmentOperation(ack) ||
             ack.productId != input.productId ||
             ack.reportedTransactionId != input.transactionId ||
             ack.reference.trim().isEmpty ||
@@ -1533,66 +1657,27 @@ extension _AppleDelivery on ApplePayments {
     }
     final fresh = await _saveDisposition(db, p, ack);
     if (!fresh) return p['conflict'] == 0 ? id : null;
-    // Only missing predecessor evidence can resolve itself. An open ownership
-    // or disposition dispute requires an explicit revision-bound adjudication.
-    if (p['conflict'] == 1 && p['reason'] != 'missingPredecessor') {
+    // A further receipt can supply a missing predecessor or cover another
+    // delivery. Ownership and contradictory signed facts need adjudication.
+    if (p['conflict'] == 1 && !pendingAppleCoverage(p['reason'])) {
       await _openDispute(db, p, 'dispositionConflict', _ackPayload(ack));
       return null;
     }
-    final rows = await db
+    final facts = await db
         .query('disposition_fact', where: 'purchaseId=?', whereArgs: [id]);
-    final active = rows.where((r) => r['covered'] == 0).toList();
-    // A review can cover all older receipts. Compare its current effective
-    // receipt as well, without reviving previously overruled facts.
-    if (p['ackRef'] != null &&
-        !active.any((r) => r['reference'] == p['ackRef'])) {
-      active.add({
-        'reference': p['ackRef'],
-        'outcome': p['disposition'],
-        'scope': p['scope'],
-        'orderId': p['orderId']
-      });
-    }
-    Future<String?> freeze(String reason) async {
+    final resolution = resolveAppleDispositions(p, facts);
+    if (resolution.issue case final reason?) {
       await _openDispute(db, p, reason, _ackPayload(ack));
       return null;
     }
-
-    final references = <String, _Row>{};
-    for (final r in active) {
-      final ref = r['reference'] as String;
-      final other = references[ref];
-      if (r['scope'] != p['scope'] ||
-          r['orderId'] != p['orderId'] ||
-          other != null &&
-              (other['outcome'] != r['outcome'] ||
-                  other['supersedes'] != r['supersedes'])) {
-        return freeze('dispositionConflict');
-      }
-      references[ref] = r;
-    }
-    for (final r in active.where((r) => r['supersedes'] != null)) {
-      final prior = references[r['supersedes']];
-      if (r['outcome'] != 'refunded' || r['supersedes'] == r['reference']) {
-        return freeze('dispositionConflict');
-      }
-      if (prior == null) return freeze('missingPredecessor');
-      if (prior['outcome'] != 'delivered') return freeze('dispositionConflict');
-    }
-    final refunds = active.where((r) => r['outcome'] == 'refunded');
-    if (refunds.isNotEmpty &&
-        active.any((r) => r['outcome'] == 'delivered') &&
-        !refunds.any((r) => r['supersedes'] != null)) {
-      return freeze('dispositionConflict');
-    }
-    final candidates = refunds.isEmpty ? active : refunds;
-    final effective =
-        candidates.where((r) => r['reference'] == p['ackRef']).firstOrNull ??
-            candidates.first;
     await _amend(db, id, {
-      'ackRef': effective['reference'],
-      'disposition': effective['outcome'],
-      'reason': null,
+      'ackRef': resolution.effective!['reference'],
+      'disposition': resolution.effective!['outcome'],
+      'reason': await _hasForeignSource(db, id)
+          ? 'environmentMismatch'
+          : _requiresEnvironmentProof(p['reason'])
+              ? p['reason']
+              : null,
       'conflict': 0,
     });
     await _closeSettledAttempt(db, id);
@@ -1614,7 +1699,9 @@ extension _AppleDelivery on ApplePayments {
       final pending = <String>{};
       for (final id in targets) {
         final p = await _row(db, 'purchase', id);
-        if (p != null && p['disposition'] == null) {
+        if (p != null &&
+            p['disposition'] == null &&
+            (p['reportedId'] != null || p['verifiedId'] == null)) {
           await _addEvidence(db, id, receipt,
               source: 'refresh', context: _environment);
           pending.add(id);
@@ -1691,7 +1778,9 @@ extension _AppleDelivery on ApplePayments {
           'orderId': order,
           'appId': app,
           'environment': environment,
-          'verifiedId': verified
+          'verifiedId': verified,
+          if (canonical['reportedId'] == null && p['reportedId'] == reported)
+            'reportedId': reported,
         },
         where: 'id=?',
         whereArgs: [target]);
@@ -1705,9 +1794,10 @@ extension _AppleDelivery on ApplePayments {
     return target;
   }
 
-  bool _validClaim(AppleClaim c) =>
+  bool _validClaim(AppleClaim c, {bool allowOtherEnvironment = false}) =>
       c.appId == _appId &&
-      c.environment == _environment &&
+      (c.environment == _environment ||
+          allowOtherEnvironment && appleEnvironments.contains(c.environment)) &&
       [
         c.scope,
         c.orderId,
@@ -1723,10 +1813,58 @@ extension _AppleDelivery on ApplePayments {
       {_Row? decidedAttempt,
       Set<String>? affected,
       _Row? exactObservation}) async {
-    await _bindObservation(db, c, exact: exactObservation);
+    final attemptOnly = decidedAttempt != null &&
+        exactObservation == null &&
+        c.purchaseToken == null;
+    final financialOnly =
+        !attemptOnly && await _bindObservation(db, c, exact: exactObservation);
     var p = await _reportedPurchase(db, c.reportedTransactionId);
+    if (attemptOnly && p == null) {
+      // Independent submission evidence can arrive before any device object,
+      // or while multiple replays still await source verification.
+      if (c.disposition != null && !_matchesClaim(c, c.disposition!)) {
+        throw StateError('Invalid recovery disposition');
+      }
+      await _recordFinancialClaim(
+          db, c, await _verifiedCharge(db, c), <String>{});
+      final charge = (await _verifiedCharge(db, c))!;
+      if (_chargeOnHold(charge) ||
+          charge['scope'] != c.scope ||
+          charge['orderId'] != c.orderId) {
+        return null;
+      }
+      if (_disagrees(charge['attemptId'], decidedAttempt['id']) ||
+          _unpaidPhase(decidedAttempt['phase'])) {
+        await _conflict(
+            db, charge, decidedAttempt, 'decisionConflict', c.reference);
+        return null;
+      }
+      await db.update('purchase', {'attemptId': decidedAttempt['id']},
+          where: 'id=?', whereArgs: [charge['id']]);
+      if (_activePhase(decidedAttempt['phase'])) {
+        await db.update('attempt', {'phase': 'paid', 'reason': null},
+            where: 'id=?', whereArgs: [decidedAttempt['id']]);
+      }
+      return charge['id'] as String;
+    }
     if (p == null) {
-      if (decidedAttempt == null) throw StateError('Unknown Apple transaction');
+      if (decidedAttempt == null) {
+        // Reconciliation can book a verified payment even if the matching
+        // device report has no independent source. Keep that object unbound.
+        final prior = await _verifiedCharge(db, c);
+        if (_disagrees(prior?['token'], _wire(c.purchaseToken))) {
+          throw StateError('Conflicting Apple submission token');
+        }
+        if (!financialOnly && prior == null) {
+          throw StateError('Unknown Apple transaction');
+        }
+        if (c.disposition != null && !_matchesClaim(c, c.disposition!)) {
+          throw StateError('Invalid recovery disposition');
+        }
+        await _recordFinancialClaim(db, c, prior, affected ?? <String>{});
+        final payment = await _verifiedCharge(db, c);
+        return _chargeOnHold(payment) ? null : payment?['id'] as String?;
+      }
       final id = const Uuid().v4();
       await db.insert('purchase', {
         'id': id,
@@ -1768,6 +1906,7 @@ extension _AppleDelivery on ApplePayments {
     }
     if (const {'environmentMismatch', 'environmentConflict'}
             .contains(canonical['reason']) ||
+        await _hasForeignSource(db, canonical['id'] as String) ||
         canonical['reason'] == 'sourceUnproven' &&
             !await _provesSource(db, canonical, c) ||
         (canonical['conflict'] == 1 &&
@@ -1894,8 +2033,6 @@ extension _AppleDelivery on ApplePayments {
           if (current['attemptId'] == null && selected != null)
             'attemptId': selected['id'],
           if (current['token'] == null && token != null) 'token': token,
-          if (exactObservation != null && current['reportedId'] == null)
-            'reportedId': c.reportedTransactionId,
           if (current['claimRef'] == null) 'claimRef': c.reference,
           'conflict': 0,
           if (current['reason'] != 'needsReconciliation' ||
@@ -1914,7 +2051,9 @@ extension _AppleDelivery on ApplePayments {
         : null;
     await _reservePrimary(db, c.scope, c.orderId,
         legacyPrimary?['purchaseId'] as String? ?? target);
-    await _authorizeObservation(db, c, target, exact: exactObservation);
+    if (!attemptOnly) {
+      await _authorizeObservation(db, c, target, exact: exactObservation);
+    }
     await _closeSettledAttempt(db, target);
     if (ack != null) {
       return _recordDisposition(db, (await _row(db, 'purchase', target))!, ack);
@@ -1929,6 +2068,7 @@ extension _AppleDelivery on ApplePayments {
       a.orderId == c.orderId &&
       a.productId == c.productId &&
       a.quantity == 1 &&
+      _validFulfillmentOperation(a) &&
       a.reportedTransactionId == c.reportedTransactionId &&
       a.verifiedTransactionId == c.verifiedTransactionId &&
       a.reference.trim().isNotEmpty;
@@ -2072,15 +2212,26 @@ extension _AppleDelivery on ApplePayments {
       throw StateError(
           'Destination ownership must be confirmed in its environment');
     }
-    final receiptDispute = facts.any((f) =>
-            f['covered'] == 0 &&
-            (f['scope'] != c.scope ||
-                f['orderId'] != c.orderId ||
-                f['outcome'] != p['disposition'] ||
-                (jsonDecode(f['payload'] as String) as List)[7] !=
-                    c.verifiedTransactionId)) ||
-        p['reason'] == 'dispositionConflict' ||
-        p['reason'] == 'missingPredecessor';
+    // Transferring a fulfilled order requires compensation for the old owner,
+    // including deliveries still in dispute. An ID correction within the same
+    // order can retain its original grant.
+    final requiresCompensation =
+        facts.any((f) => f['covered'] == appleUncompensatedTransfer) ||
+            foreign && receipts.isNotEmpty ||
+            ownerChanges &&
+                (p['disposition'] == 'delivered' ||
+                    facts.any((f) => f['outcome'] == 'delivered'));
+    final receiptDispute =
+        facts.isNotEmpty && resolveAppleDispositions(p, facts).issue != null ||
+            facts.any((f) =>
+                f['covered'] == 0 &&
+                (f['scope'] != c.scope ||
+                    f['orderId'] != c.orderId ||
+                    f['outcome'] != p['disposition'] ||
+                    (jsonDecode(f['payload'] as String) as List)[7] !=
+                        c.verifiedTransactionId)) ||
+            p['reason'] == 'dispositionConflict' ||
+            pendingAppleCoverage(p['reason']);
     if (receipts.isNotEmpty &&
             (ownerChanges ||
                 changesIdentity ||
@@ -2088,10 +2239,15 @@ extension _AppleDelivery on ApplePayments {
                 proofs.isNotEmpty) &&
             finalAck == null ||
         finalAck != null &&
-            (!_matchesClaim(c, finalAck) || !covered.containsAll(receipts)) ||
-        (foreign &&
-            receipts.isNotEmpty &&
-            finalAck?.outcome != AppleOutcome.refunded) ||
+            (!_matchesClaim(c, finalAck) ||
+                !covered.containsAll(receipts) ||
+                finalAck.supersedes != null &&
+                    (finalAck.outcome != AppleOutcome.refunded ||
+                        finalAck.supersedes == finalAck.reference ||
+                        !facts.any((f) =>
+                            f['reference'] == finalAck.supersedes &&
+                            f['outcome'] == 'delivered'))) ||
+        requiresCompensation && finalAck?.outcome != AppleOutcome.refunded ||
         !receipts.containsAll(covered)) {
       throw StateError(
           'Apple review requires authenticated disposition covering existing receipts');
@@ -2108,9 +2264,14 @@ extension _AppleDelivery on ApplePayments {
     }
     if (!foreign) await _saveClaim(db, p, c);
     if (finalAck != null) await _saveDisposition(db, p, finalAck);
-    for (final table in ['claim_fact', 'disposition_fact']) {
-      await db.update(table, {'covered': 1},
+    await db.update('claim_fact', {'covered': 1},
+        where: 'purchaseId=?', whereArgs: [id]);
+    if (finalAck != null) {
+      await db.update('disposition_fact', {'covered': 1},
           where: 'purchaseId=?', whereArgs: [id]);
+      await db.update('disposition_fact', {'covered': appleReviewedDisposition},
+          where: 'purchaseId=? AND payload=?',
+          whereArgs: [id, _ackPayload(finalAck)]);
     }
     await db.insert('dispute_review', {
       'issuer': r.issuer,
@@ -2144,7 +2305,8 @@ extension _AppleDelivery on ApplePayments {
             ]);
       }
     }
-    if (foreign && p['attemptId'] != null) {
+    final sourceHeld = await _hasForeignSource(db, id);
+    if (sourceHeld && p['attemptId'] != null) {
       await db.update('attempt', {'reason': 'environmentMismatch'},
           where: 'id=?', whereArgs: [p['attemptId']]);
     }
@@ -2168,7 +2330,7 @@ extension _AppleDelivery on ApplePayments {
       'orderId': c.orderId,
       if (!foreign) 'claimRef': c.reference,
       'conflict': 0,
-      'reason': foreign ? 'environmentMismatch' : null,
+      'reason': sourceHeld ? 'environmentMismatch' : null,
       if (ownerChanges)
         'attemptId': source['id'] != id &&
                 p['attemptId'] == null &&
@@ -2185,7 +2347,7 @@ extension _AppleDelivery on ApplePayments {
       await _replacePrimaryAfterReview(db, p, affected);
     }
     await _reservePrimary(db, c.scope, c.orderId, id);
-    if (!foreign && authorizeItems) {
+    if (!sourceHeld && authorizeItems) {
       await _authorizeObservation(db, c, id, exact: exactObservation);
     }
     return id;

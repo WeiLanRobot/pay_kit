@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'verified_queue_fixture.dart';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:pay_kit/pay_kit.dart';
@@ -72,17 +74,19 @@ void main() {
       () async {
     final pending = account.buy(productId: 'sku', orderId: 'O');
     await store.preparing.future;
-    store.event(null, 'historical');
+    store.event(null, 'historical', handle: 'history');
     await payments.settle();
-    await payments.reconcile(const AppleClaim(
-        appId: 'app',
-        environment: 'sandbox',
-        scope: 'A',
-        orderId: 'O',
-        productId: 'sku',
-        reportedTransactionId: 'historical',
-        verifiedTransactionId: 'historical',
-        reference: 'authenticated-order'));
+    await proveQueue(
+        payments,
+        const AppleClaim(
+            appId: 'app',
+            environment: 'sandbox',
+            scope: 'A',
+            orderId: 'O',
+            productId: 'sku',
+            reportedTransactionId: 'historical',
+            verifiedTransactionId: 'historical',
+            reference: 'authenticated-order'));
     store.prepared.complete();
     final order = await pending;
     await payments.settle();
@@ -153,19 +157,21 @@ void main() {
     store.launch = () async => false;
     expect(
         (await account.buy(productId: 'sku', orderId: 'O')).phase, 'declined');
-    store.event(null, 'T');
+    store.event(null, 'T', handle: 'h');
     await payments.settle();
     final observed = (await payments.unmatched()).single;
-    await payments.reconcile(AppleClaim(
-        appId: 'app',
-        environment: 'sandbox',
-        scope: 'A',
-        orderId: 'O',
-        productId: 'sku',
-        reportedTransactionId: 'T',
-        verifiedTransactionId: 'T',
-        reference: 'server-proof',
-        observationId: observed.id));
+    await proveQueue(
+        payments,
+        AppleClaim(
+            appId: 'app',
+            environment: 'sandbox',
+            scope: 'A',
+            orderId: 'O',
+            productId: 'sku',
+            reportedTransactionId: 'T',
+            verifiedTransactionId: 'T',
+            reference: 'server-proof',
+            observationId: observed.id));
     await payments.settle();
     final order = await account.buy(productId: 'sku', orderId: 'O');
     expect(order.phase, 'paid');
@@ -209,19 +215,21 @@ void main() {
     final original = (await payments.unresolvedAttempts()).single.attemptId;
     await stop();
     await start();
-    store.event('O', 'T');
+    store.event('O', 'T', handle: 'h');
     await payments.settle();
     final item = (await payments.unmatched()).single;
-    await payments.reconcile(AppleClaim(
-        appId: 'app',
-        environment: 'sandbox',
-        scope: 'A',
-        orderId: 'O',
-        productId: 'sku',
-        reportedTransactionId: 'T',
-        verifiedTransactionId: 'T',
-        reference: 'order-only',
-        observationId: item.id));
+    await proveQueue(
+        payments,
+        AppleClaim(
+            appId: 'app',
+            environment: 'sandbox',
+            scope: 'A',
+            orderId: 'O',
+            productId: 'sku',
+            reportedTransactionId: 'T',
+            verifiedTransactionId: 'T',
+            reference: 'order-only',
+            observationId: item.id));
     await payments.settle();
     expect((await account.lookup('O'))!.attemptId, isNull);
     expect(receipts.single.attemptId, isNull);
@@ -231,23 +239,25 @@ void main() {
   test(
       'finishing one recovered charge retains the shared receipt for the other',
       () async {
-    store.event(null, 'T1', receipt: 'shared');
-    store.event(null, 'T2', receipt: 'shared');
+    store.event(null, 'T1', receipt: 'shared', handle: 'h1');
+    store.event(null, 'T2', receipt: 'shared', handle: 'h2');
     await payments.settle();
     for (final transaction in ['T1', 'T2']) {
       final item = (await payments.unmatched())
           .singleWhere((i) => i.transactionId == transaction);
       expect(item.receipts, ['shared']);
-      await payments.reconcile(AppleClaim(
-          appId: 'app',
-          environment: 'sandbox',
-          scope: 'A',
-          orderId: transaction,
-          productId: 'sku',
-          reportedTransactionId: transaction,
-          verifiedTransactionId: transaction,
-          reference: 'proof-$transaction',
-          observationId: item.id));
+      await proveQueue(
+          payments,
+          AppleClaim(
+              appId: 'app',
+              environment: 'sandbox',
+              scope: 'A',
+              orderId: transaction,
+              productId: 'sku',
+              reportedTransactionId: transaction,
+              verifiedTransactionId: transaction,
+              reference: 'proof-$transaction',
+              observationId: item.id));
       await payments.settle();
     }
     expect(store.finished.map((e) => e.transactionId), ['T1', 'T2']);

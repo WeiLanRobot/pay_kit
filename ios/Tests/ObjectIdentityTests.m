@@ -43,6 +43,7 @@
 
 @interface LocalItem : NSObject
 @property(nonatomic) SKPaymentTransactionState transactionState;
+@property(nonatomic) NSInteger quantity;
 @property(nonatomic, strong) NSError *error;
 @property(nonatomic, copy) NSString *transactionIdentifier;
 @property(nonatomic, copy) NSString *productIdentifier;
@@ -55,8 +56,20 @@
   LocalItem *item = [[LocalItem alloc] init];
   item.transactionState = state;
   item.productIdentifier = @"coins";
+  item.quantity = 1;
   item.applicationUsername = @"same";
   return item;
+}
+@end
+
+@interface RecordingChannel : NSObject
+@property(nonatomic, copy) NSString *method;
+@property(nonatomic, copy) NSDictionary *arguments;
+@end
+@implementation RecordingChannel
+- (void)invokeMethod:(NSString *)method arguments:(NSDictionary *)arguments {
+  self.method = method;
+  self.arguments = arguments;
 }
 @end
 
@@ -122,6 +135,53 @@
   NSArray *afterDetach = [self call:other method:@"start" args:@{}][@"transactions"];
   XCTAssertNotEqualObjects(items[2][@"handle"], afterDetach[0][@"handle"]);
   [other stopObserving];
+}
+
+- (void)testProofRechecksNativeQueueImmediatelyBeforeDispatch {
+  LocalItem *item = [LocalItem item:SKPaymentTransactionStatePurchased];
+  item.transactionIdentifier = @"T";
+  item.productIdentifier = @"test.coins";
+  LocalQueue *queue = [LocalQueue new];
+  queue.transactions = @[item];
+  queue.finished = [NSMutableArray array];
+  TestPlugin *plugin = [TestPlugin new];
+  plugin.fixture = queue;
+  RecordingChannel *channel = [RecordingChannel new];
+  [plugin setValue:channel forKey:@"channel"];
+  NSDictionary *snapshot = [self call:plugin method:@"start" args:@{}];
+  NSMutableDictionary *args = [snapshot[@"transactions"][0] mutableCopy];
+  args[@"verifiedQueue"] = @{@"transactionId": @"T", @"productId": @"test.coins", @"token": @"same"};
+
+  // Another handle appeared before the channel call, without a Dart update.
+  LocalItem *duplicate = [LocalItem item:SKPaymentTransactionStatePurchased];
+  duplicate.transactionIdentifier = @"T";
+  queue.transactions = @[item, duplicate];
+  XCTAssertEqualObjects([(FlutterError *)[self call:plugin method:@"finish" args:args] code], @"ambiguous_transaction");
+  LocalItem *restore = [LocalItem item:SKPaymentTransactionStateRestored];
+  restore.transactionIdentifier = @"restore";
+  restore.originalTransaction = duplicate;
+  queue.transactions = @[item, restore];
+  XCTAssertEqualObjects([(FlutterError *)[self call:plugin method:@"finish" args:args] code], @"ambiguous_transaction");
+
+  NSArray *both = [self call:plugin method:@"snapshot" args:@{}][@"transactions"];
+  queue.transactions = @[item];
+  [plugin paymentQueue:(SKPaymentQueue *)queue removedTransactions:@[(id)restore]];
+  XCTAssertEqualObjects(channel.method, @"removed");
+  XCTAssertEqualObjects(channel.arguments[@"writer"], @"A");
+  XCTAssertEqualObjects(channel.arguments[@"transactions"][0][@"handle"], both[1][@"handle"]);
+  XCTAssertEqualObjects(channel.arguments[@"receipt"], @"");
+  item.quantity = 2;
+  XCTAssertEqualObjects([(FlutterError *)[self call:plugin method:@"finish" args:args] code], @"state_changed");
+  item.quantity = 1;
+  item.applicationUsername = @"another";
+  XCTAssertEqualObjects([(FlutterError *)[self call:plugin method:@"finish" args:args] code], @"state_changed");
+  item.applicationUsername = @"same";
+  XCTAssertEqual(queue.finished.count, 0u);
+  XCTAssertNil([self call:plugin method:@"finish" args:args]);
+  XCTAssertEqualObjects(queue.finished, (@[item]));
+  [plugin paymentQueue:(SKPaymentQueue *)queue removedTransactions:@[(id)item]];
+  XCTAssertEqualObjects(channel.arguments[@"transactions"][0][@"handle"], args[@"handle"]);
+  [plugin stopObserving];
 }
 
 - (void)testStopCompletesPendingStoreRequestsOnce {
