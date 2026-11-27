@@ -303,10 +303,328 @@ void main() {
     expect(verifications, 0);
   });
 
+  Future<String> submitLegacyOrder() async {
+    final owner = Object();
+    pay.attachLegacy(owner, (_) async {}, (_, __) {}, (_) {});
+    await pay.buyLegacy(owner, 'sku', 'order');
+    pay.detachLegacy(owner);
+    return journal.read((db) async =>
+        (await db.query('attempt', columns: ['id'])).single['id'] as String);
+  }
+
+  for (final change in ['new reservation', 'attempt conflict']) {
+    test('pending exact finish is revoked after $change', () async {
+      final attempt = await submitLegacyOrder();
+      await close();
+      await start();
+      final id = await observe('pending-finish', wire: 'order');
+      store.failFinish = true;
+      await pay.recoverObservation(claim(id, verified: 'R'),
+          verifiedQueueTransaction: verifiedItem(id));
+      await pay.settle();
+      expect(store.finished, isEmpty);
+      await journal.write((db) async {
+        if (change == 'attempt conflict') {
+          expect(
+              await db.update('attempt', {'phase': 'conflict'},
+                  where: "id=? AND phase='paid'", whereArgs: [attempt]),
+              1);
+        } else {
+          await db.insert('recovery.submission', {
+            'token': 'order',
+            'origin': 'production',
+            'attemptId': 'competing',
+          });
+        }
+      });
+      store.failFinish = false;
+      await pay.retryPending();
+      await pay.settle();
+      expect(store.finished, isEmpty);
+    });
+  }
+
+  for (final owner in ['A', 'B']) {
+    test('accepted order with pending server decision for $owner', () async {
+      final attempt = await submitLegacyOrder();
+      await pay.resolveAttempt(AppleAttemptDecision(
+          issuer: 'backend',
+          decisionId: 'pending',
+          attemptId: attempt,
+          appId: 'app',
+          environment: 'sandbox',
+          scope: owner,
+          orderId: 'order',
+          reference: 'pending-from-server',
+          outcome: AppleAttemptOutcome.pending));
+      await close();
+      await start();
+      final id = await observe('replayed');
+      final other = await observe('other-payment', reported: 'R2');
+      final proof = verifiedItem(id);
+      await expectLater(
+          pay.recoverObservation(claim(other, report: 'R2', verified: 'R2'),
+              verifiedQueueTransaction: proof),
+          throwsStateError);
+      final recovery = pay.recoverObservation(claim(id, verified: 'R'),
+          verifiedQueueTransaction: proof);
+      if (owner == 'A') {
+        await recovery;
+      } else {
+        await expectLater(recovery, throwsStateError);
+      }
+      await pay.settle();
+      expect(store.finished.map((e) => e.native),
+          owner == 'A' ? ['replayed'] : isEmpty);
+      expect((await pay.unmatched()).expand((t) => t.observations.keys),
+          contains(other));
+    });
+  }
+
+  test(
+      'legacy proof preserves the scoped purchase already bound to this transaction',
+      () async {
+    await submitLegacyOrder();
+    final active = await account.buy(
+        productId: 'sku', orderId: 'order', purchaseToken: token);
+    store.event(token, 'R');
+    await pay.settle();
+    store.failFinish = true;
+    await pay.reconcile(claim(null, wire: token, verified: 'R'));
+    await pay.settle();
+    await journal.read((db) async {
+      final charge = (await db.query('purchase')).single;
+      expect(charge['attemptId'], active.attemptId);
+      expect(charge['disposition'], 'delivered');
+    });
+    await close();
+    await start();
+    final id = await observe('replay-without-token');
+    await expectLater(
+        pay.recoverObservation(claim(id, verified: 'R'),
+            verifiedQueueTransaction: verifiedItem(id)),
+        throwsStateError);
+    await pay.settle();
+    await journal.read((db) async {
+      final charge = (await db.query('purchase')).single;
+      expect(charge['attemptId'], active.attemptId);
+      expect(charge['conflict'], 0);
+      expect(charge['disposition'], 'delivered');
+      expect(await db.query('conflict_fact'), isEmpty);
+      expect(await db.query('recovery.verified_queue_transaction'), isEmpty);
+    });
+    expect(store.finished, isEmpty);
+  });
+
+  for (final competing in [false, true]) {
+    test(
+        'a charge in a partition without the original attempt (competing=$competing)',
+        () async {
+      await close();
+      store = ProbeStore();
+      journal = AppleJournal(() async => File('${dir.path}/ledger'));
+      pay = ApplePayments.forTesting(store, journal);
+      await submitLegacyOrder();
+      await close();
+      await start('production');
+      final candidate = competing ? 'order' : 'unrelated';
+      final prodId =
+          await observe('prod-event', wire: candidate, reported: 'P');
+      await pay.reconcile(claim(prodId,
+          env: 'production',
+          owner: 'B',
+          report: 'P',
+          verified: 'P',
+          reference: 'ack-prod'));
+      await pay.settle();
+      await journal.read((db) async {
+        expect(await db.query('attempt'), isEmpty);
+        expect((await db.query('purchase')).single['token'], candidate);
+      });
+      await close();
+      await start('sandbox');
+      final s = await observe('sandbox-event', wire: 'order', reported: 'R');
+      final result = pay.recoverObservation(claim(s, verified: 'R'),
+          verifiedQueueTransaction: verifiedItem(s));
+      if (competing) {
+        await expectLater(result, throwsStateError);
+      } else {
+        await result;
+      }
+      await pay.settle();
+      expect(store.finished.map((e) => e.native),
+          competing ? isEmpty : ['sandbox-event']);
+    });
+  }
+
+  for (final conflict in [
+    'environment',
+    'product',
+    'uncertain',
+    'declined',
+    'missing attempt',
+    'multiple'
+  ]) {
+    test('registered legacy recovery rejects $conflict conflict atomically',
+        () async {
+      if (conflict == 'environment') {
+        await close();
+        await start('production');
+      }
+      if (conflict == 'uncertain') {
+        store.launch = () async => throw StateError('unknown launch result');
+      } else if (conflict == 'declined') {
+        store.launch = () async => false;
+      }
+      final owner = Object();
+      pay.attachLegacy(owner, (_) async {}, (_, __) {}, (_) {});
+      final launch = pay.buyLegacy(
+          owner, conflict == 'product' ? 'other-sku' : 'sku', 'order');
+      if (conflict == 'uncertain') {
+        await expectLater(launch, throwsA(isA<StoreSubmissionUnresolved>()));
+      } else if (conflict == 'declined') {
+        await expectLater(launch, throwsA(isA<StorePurchaseRejected>()));
+      } else {
+        await launch;
+      }
+      pay.detachLegacy(owner);
+      if (conflict == 'missing attempt') {
+        await journal.write((db) => db.delete('attempt'));
+      }
+      if (conflict == 'multiple') {
+        await journal.write((db) => db.insert('recovery.submission', {
+              'token': 'order',
+              'origin': 'legacy',
+              'attemptId': 'other-attempt',
+            }));
+      }
+      await close();
+      await start();
+      final id = await observe('conflicting-replay', wire: 'order');
+      await expectLater(
+          pay.recoverObservation(claim(id, verified: 'R'),
+              verifiedQueueTransaction: verifiedItem(id)),
+          throwsStateError);
+      await pay.settle();
+      expect(store.finished, isEmpty);
+      await journal.read((db) async {
+        expect(await db.query('recovery.verified_queue_transaction'), isEmpty);
+        expect(await db.query('disposition_fact'), isEmpty);
+        final observation = (await db
+                .query('recovery.observation', where: 'id=?', whereArgs: [id]))
+            .single;
+        expect(observation['boundPurchase'], isNull);
+      });
+    });
+  }
+
+  for (final mode in ['managed', 'compatibility', 'handoff']) {
+    for (final pending in [false, true]) {
+      test(
+          'BuyEngine accepted order survives two replays '
+          '(mode=$mode, pending=$pending)', () async {
+        if (mode != 'managed') {
+          await close();
+          store = ProbeStore();
+          journal = AppleJournal(() async => File('${dir.path}/ledger'));
+          pay = ApplePayments.forTesting(store, journal);
+        }
+        var checkoutFinished = Completer<void>();
+        PayKit.initialize(DefaultPayConfig(
+          showLoadingHandler: () {},
+          dismissLoadingHandler: () => checkoutFinished.complete(),
+          showToastHandler: (_,
+              {bool isTip = false, bool lengthLong = false}) {},
+          logHandler: (_, __) {},
+        ));
+        addTearDown(() => PayKit.initialize(DefaultPayConfig()));
+        final engine = BuyEngine(payments: pay);
+        engine.initialize((_) => fail('abandoned receiver called'));
+        engine.buyProduct('sku', 'order');
+        // The void compatibility API completes through its UI callback.
+        await checkoutFinished.future;
+        await pay.settle();
+        expect(store.submitted, ['order']);
+        if (pending) {
+          store.event('order', null, status: StoreStatus.pending);
+          await pay.settle();
+        }
+        final attemptId = await journal
+            .read((db) async => (await db.query('attempt')).single['id']);
+        if (mode == 'handoff') {
+          await pay.start(environment: 'sandbox');
+          expect(
+              await journal
+                  .read((db) async => (await db.query('attempt')).single['id']),
+              attemptId);
+        }
+        // Apple does not guarantee a non-UUID business order will be echoed.
+        final wire = pending ? 'order' : null;
+        engine.dispose();
+        await close();
+        await start();
+        await observe('first-restart', wire: wire);
+        await close();
+        await start();
+        final id = await observe('second-restart', wire: wire);
+        store.failFinish = true;
+        await pay.recoverObservation(claim(id, verified: 'R'),
+            verifiedQueueTransaction: verifiedItem(id));
+        await pay.settle();
+        expect(store.finished, isEmpty);
+        await close();
+        await start();
+        final replay = await observe('finish-retry', wire: wire);
+        // Match the SK1 bridge: a product in the queue rejects a new purchase
+        // until StoreKit confirms removal of the outstanding item.
+        final accepted = <String>[];
+        store.launch = () async {
+          if (store.finished.every((item) => item.native != 'finish-retry')) {
+            throw const StorePurchaseRejected();
+          }
+          accepted.add(store.submitted.last);
+          return true;
+        };
+        final next = BuyEngine(payments: pay)..initialize((_) {});
+        addTearDown(next.dispose);
+        checkoutFinished = Completer<void>();
+        next.buyProduct('sku', 'blocked-order');
+        await checkoutFinished.future;
+        expect(store.submitted, ['blocked-order']);
+        expect(accepted, isEmpty);
+        await expectLater(
+            pay.recoverObservation(claim(replay, verified: 'R'),
+                verifiedQueueTransaction: verifiedItem(id)),
+            throwsStateError);
+        await pay.recoverObservation(
+            claim(replay, verified: 'R', terminal: false),
+            verifiedQueueTransaction: verifiedItem(replay));
+        await pay.settle();
+        expect(store.finished.map((e) => e.native), ['finish-retry']);
+        await journal.read((db) async {
+          final purchase = (await db.query('purchase')).single;
+          expect(purchase['attemptId'], attemptId);
+          expect(purchase['disposition'], 'delivered');
+          expect(
+              (await db.query('attempt', where: 'id=?', whereArgs: [attemptId]))
+                  .single['phase'],
+              'paid');
+        });
+        checkoutFinished = Completer<void>();
+        next.buyProduct('sku', 'next-order');
+        await checkoutFinished.future;
+        await pay.settle();
+        expect(accepted, ['next-order']);
+      });
+    }
+  }
+
   test('legacy replay finishes only the verified item on a shared app receipt',
       () async {
     final prior = await observe('previous-run', wire: 'order');
     await close();
+    // An unrelated, interrupted first installation may leave an empty partition.
+    await File('${dir.path}/ledger.compat').create();
     await start();
     final current = await observe('current', wire: 'order');
     final other = await observe('other', wire: 'another-order', reported: 'R2');

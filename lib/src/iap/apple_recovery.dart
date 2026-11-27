@@ -132,12 +132,13 @@ extension _AppleRecovery on ApplePayments {
         _objectKey(other) != _objectKey(event));
   }
 
-  Future<void> _acceptVerifiedQueueTransaction(
+  Future<_Row?> _acceptVerifiedQueueTransaction(
       DatabaseExecutor db,
       AppleClaim c,
       _Row r,
       _Row? purchase,
-      AppleVerifiedQueueTransaction proof) async {
+      AppleVerifiedQueueTransaction proof,
+      List<String> sources) async {
     final id = proof.observationId;
     if (id != r['id'] ||
         proof.transactionId != c.reportedTransactionId ||
@@ -185,7 +186,7 @@ extension _AppleRecovery on ApplePayments {
       throw StateError(
           'Apple observation requires existing dispute resolution');
     }
-    if (prior.isNotEmpty && r['finished'] == 1) return;
+    if (prior.isNotEmpty && r['finished'] == 1) return null;
     final event = _currentUnbound[id];
     if (event == null ||
         r['generation'] != _generation ||
@@ -207,37 +208,124 @@ extension _AppleRecovery on ApplePayments {
     if (candidate.isEmpty) {
       throw StateError('Verified receipt does not belong to this observation');
     }
-    if (await _legacyQueueHistoryConflicts(
-        db, c.orderId, c.productId, c.environment, proof.transactionId)) {
+    final submission = await _inspectLegacySubmission(db, record, sources);
+    if (submission.conflict || await _legacyQueueHistoryConflicts(db, record)) {
       throw StateError('Conflicting Apple transaction source');
+    }
+    final attempt = submission.attempt;
+    // The verified charge and the device alias may already name a different
+    // submission even when neither carries the legacy wire string.
+    final reported = await _reportedPurchase(db, c.reportedTransactionId);
+    for (final charge in [purchase, reported].nonNulls) {
+      if (_disagrees(charge['token'], c.orderId) ||
+          charge['attemptId'] != null &&
+              charge['attemptId'] != attempt?['id']) {
+        throw StateError('Conflicting Apple transaction source');
+      }
+    }
+    if (attempt != null && await _row(db, 'attempt', attempt['id']) == null) {
+      // The compatibility partition can be the only copy after a cold start.
+      await db.insert('attempt', attempt);
     }
     if (prior.isEmpty) {
       await db.insert('recovery.verified_queue_transaction', record);
     }
+    return attempt;
   }
 
-  Future<bool> _legacyQueueHistoryConflicts(DatabaseExecutor db, String order,
-      String product, String environment, String transaction) async {
-    // Keep the legacy exception out of registered submissions and disputed
-    // histories, even when the selected observation by itself looks consistent.
-    final conflict =
-        await db.rawQuery('''SELECT 1 FROM recovery.submission WHERE token=?
-      UNION ALL SELECT 1 FROM recovery.observation WHERE (reportedId=? OR queueId=?)
+  // A reservation records intent. Only its original, accepted BuyEngine
+  // submission may be bound by an independently verified queue transaction.
+  Future<({bool conflict, _Row? attempt})> _inspectLegacySubmission(
+      DatabaseExecutor db, _Row proof, List<String> sources) async {
+    const conflict = (conflict: true, attempt: null);
+    final order = proof['orderId'] as String;
+    final reservations = await db.query('recovery.submission',
+        where: 'token=?', whereArgs: [appleWireKey(order)]);
+    if (reservations.isEmpty) return (conflict: false, attempt: null);
+    if (reservations.length != 1 ||
+        reservations.single['origin'] != 'legacy' ||
+        Uuid.isValidUUID(fromString: order)) {
+      return conflict;
+    }
+    final id = reservations.single['attemptId'];
+    _Row? original;
+    for (final source in sources) {
+      final rows = await db.rawQuery(
+          'SELECT * FROM $source.attempt WHERE id=? OR wireToken=?',
+          [id, order]);
+      final charges = await db.rawQuery(
+          'SELECT * FROM $source.purchase WHERE attemptId=? OR token=?',
+          [id, order]);
+      if (rows.isEmpty && charges.isEmpty) continue;
+      final header = (await db.rawQuery('SELECT * FROM $source.meta')).single;
+      if (rows.length > 1 ||
+          _disagrees(header['appId'], proof['appId']) ||
+          _disagrees(header['environment'], proof['environment'])) {
+        return conflict;
+      }
+      for (final p in charges) {
+        if (_chargeOnHold(p) ||
+            p['originalId'] != null ||
+            source != 'main' && p['disposition'] != null ||
+            _disagrees(p['appId'], proof['appId']) ||
+            _disagrees(p['token'], order) ||
+            _disagrees(p['attemptId'], id) ||
+            _disagrees(p['reportedId'], proof['transactionId']) ||
+            _disagrees(p['verifiedId'], proof['transactionId']) ||
+            _disagrees(p['environment'], proof['environment']) ||
+            _disagrees(p['scope'], proof['scope']) ||
+            _disagrees(p['orderId'], order) ||
+            p['productId'] != proof['productId']) {
+          return conflict;
+        }
+      }
+      if (rows.isEmpty) continue;
+      final a = rows.single;
+      if (a['id'] != id ||
+          a['mode'] != 'legacy' ||
+          a['legacySubmission'] != 'accepted' ||
+          a['wireToken'] != order ||
+          a['orderId'] != order ||
+          a['productId'] != proof['productId'] ||
+          a['submittedId'] != null ||
+          !const {'accepted', 'pending', 'paid'}.contains(a['phase']) ||
+          a['reason'] != null &&
+              a['reason'] != 'serverPending' &&
+              !(a['phase'] == 'pending' && a['reason'] == 'store_pending')) {
+        return conflict;
+      }
+      final decisions = await db.rawQuery(
+          'SELECT result,payload FROM $source.decision WHERE attemptId=?',
+          [id]);
+      if (decisions.any((d) =>
+          d['result'] == 'conflict' ||
+          (jsonDecode(d['payload'] as String) as List)[2] != proof['scope'])) {
+        return conflict;
+      }
+      original ??= a;
+    }
+    return (conflict: original == null, attempt: original);
+  }
+
+  Future<bool> _legacyQueueHistoryConflicts(
+      DatabaseExecutor db, _Row proof) async {
+    final transaction = proof['transactionId'];
+    final conflict = await db.rawQuery('''SELECT 1 FROM recovery.observation
+      WHERE (reportedId=? OR queueId=?)
       AND (status NOT IN ('pending','paid') OR originalId IS NOT NULL
         OR reportedId!=? OR queueId!=? OR productId!=? OR token!=?
         OR actual!=? OR boundEnvironment!=? OR verifiedId!=?
         OR reason IN ('identityConflict','environmentConflict','environmentRejected',
           'originalSubmissionConflict','compatibilityTransferred'))
       LIMIT 1''', [
-      order,
       transaction,
       transaction,
       transaction,
       transaction,
-      product,
-      order,
-      environment,
-      environment,
+      proof['productId'],
+      proof['orderId'],
+      proof['environment'],
+      proof['environment'],
       transaction
     ]);
     return conflict.isNotEmpty;
@@ -256,7 +344,7 @@ extension _AppleRecovery on ApplePayments {
       throw StateError('Invalid Apple observation claim');
     }
     final affected = <String>{};
-    final state = await _journal.write((db) async {
+    final state = await _journal.recover((db, sources) async {
       var r = await _row(db, 'recovery.observation', id);
       if (r == null) throw StateError('Unknown Apple observation');
       if (r['status'] != 'paid' ||
@@ -302,9 +390,10 @@ extension _AppleRecovery on ApplePayments {
         }
         purchase = reviewed;
       }
-      if (queueProof != null) {
-        await _acceptVerifiedQueueTransaction(db, c, r, purchase, queueProof);
-      }
+      final recoveredAttempt = queueProof == null
+          ? null
+          : await _acceptVerifiedQueueTransaction(
+              db, c, r, purchase, queueProof, sources);
       final proven =
           queueProof != null || await _sourceForObservation(db, c, r);
       if (proven) {
@@ -314,7 +403,16 @@ extension _AppleRecovery on ApplePayments {
           throw StateError(
               'Reported Apple identity already bound to a different verified charge');
         }
-        await _applyClaim(db, c, exactObservation: r, affected: affected);
+        final applied = await _applyClaim(db, c,
+            exactObservation: r,
+            affected: affected,
+            decidedAttempt: recoveredAttempt);
+        if (applied != null &&
+            recoveredAttempt != null &&
+            (await _row(db, 'purchase', applied))?['attemptId'] !=
+                recoveredAttempt['id']) {
+          throw StateError('Apple claim has no confirmed submission binding');
+        }
       } else if (c.disposition != null ||
           purchase?['disposition'] != null ||
           c.review != null && purchase != null) {
@@ -358,7 +456,7 @@ extension _AppleRecovery on ApplePayments {
               : current['reason'] == 'originalSubmissionConflict'
                   ? 'originalSubmissionConflict'
                   : purchase?['reason'] as String? ?? status.name);
-    });
+    }, legacyOrderId: queueProof == null ? null : c.orderId);
     _changed();
     for (final id in affected) {
       _schedule(id);

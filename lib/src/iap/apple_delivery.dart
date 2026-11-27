@@ -902,11 +902,21 @@ extension _AppleDelivery on ApplePayments {
               proof['transactionId'] != p['verifiedId'] ||
               proof['scope'] != p['scope'] ||
               proof['orderId'] != p['orderId'] ||
+              _disagrees(p['token'], proof['orderId']) ||
               proof['productId'] != p['productId'] ||
               !e.allowsUnownedFinish ||
               !_onlyLiveQueueObject(e) ||
-              await _legacyQueueHistoryConflicts(db, proof['orderId'] as String,
-                  e.productId, proof['environment'] as String, reported)) {
+              await _legacyQueueHistoryConflicts(db, proof)) {
+            return false;
+          }
+          // The journal holds the app-wide writer lock. Only the active
+          // partition and the shared reservation can change before this retry.
+          final submission =
+              await _inspectLegacySubmission(db, proof, ['main']);
+          if (submission.conflict ||
+              submission.attempt?['id'] != p['attemptId'] ||
+              submission.attempt != null &&
+                  submission.attempt!['phase'] != 'paid') {
             return false;
           }
         }

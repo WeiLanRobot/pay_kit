@@ -247,14 +247,51 @@ class AppleJournal {
       });
 
   Future<T> write<T>(Future<T> Function(DatabaseExecutor db) op) =>
-      _enqueue(() async {
-        final db = await _open();
-        return db.transaction((tx) async {
-          final result = await op(tx);
-          await tx.rawUpdate('UPDATE meta SET revision = revision + 1');
-          return result;
-        });
+      _enqueue(() async => _writeTransaction(await _open(), op));
+
+  Future<T> _writeTransaction<T>(
+          Database db, Future<T> Function(DatabaseExecutor db) op) =>
+      db.transaction((tx) async {
+        final result = await op(tx);
+        await tx.rawUpdate('UPDATE meta SET revision = revision + 1');
+        return result;
       });
+
+  /// Only a registered legacy wire can have an originating attempt in another
+  /// partition. Inspect the partitions validated at startup under the common
+  /// writer lock, then bind the observation and its proof in one transaction.
+  Future<T> recover<T>(
+      Future<T> Function(DatabaseExecutor db, List<String> sources) op,
+      {String? legacyOrderId}) {
+    if (legacyOrderId == null) return write((tx) => op(tx, const ['main']));
+    return _enqueue(() async {
+      final db = await _open();
+      final partitions = await db.rawQuery('''SELECT name
+        FROM recovery.indexed_partition WHERE EXISTS (
+          SELECT 1 FROM recovery.submission WHERE origin='legacy' AND token=?)''',
+          [appleWireKey(legacyOrderId)]);
+      final sources = ['main'];
+      try {
+        if (partitions.isNotEmpty) {
+          final names = partitions.map((row) => row['name']).toSet();
+          final base = await _location();
+          for (final suffix in _partitionSuffixes) {
+            if (!names.contains(suffix)) continue;
+            final file = File('${base.path}$suffix');
+            if (file.path == db.path || !await file.exists()) continue;
+            final alias = 'recovery_source_${sources.length}';
+            await db.execute('ATTACH DATABASE ? AS $alias', [file.path]);
+            sources.add(alias);
+          }
+        }
+        return await _writeTransaction(db, (tx) => op(tx, sources));
+      } finally {
+        for (final alias in sources.skip(1).toList().reversed) {
+          await db.execute('DETACH DATABASE $alias');
+        }
+      }
+    });
+  }
 
   Future<void> close() => _enqueue(() async {
         await _database?.close();
@@ -312,11 +349,7 @@ Future<void> reserveAppleToken(
 /// file. Index all existing partitions before any observer can use a receipt.
 /// Multiple origins are preserved so known collisions remain unprovable.
 Future<void> _indexSubmissions(Database db, String base, String? app) async {
-  for (final suffix in [
-    '.compat',
-    '',
-    ...appleEnvironments.map((e) => '.$e')
-  ]) {
+  for (final suffix in _partitionSuffixes) {
     final source = suffix.isEmpty ? 'main' : 'prior_partition';
     if (suffix.isNotEmpty) {
       final path = '$base$suffix';
@@ -462,6 +495,11 @@ Future<void> restoreUnprovenAttempts(DatabaseExecutor db,
 }
 
 const appleEnvironments = {'production', 'sandbox', 'xcode'};
+final _partitionSuffixes = [
+  '.compat',
+  '',
+  ...appleEnvironments.map((e) => '.$e'),
+];
 
 const _recoverySchema = [
   '''CREATE TABLE IF NOT EXISTS recovery.verified_queue_transaction(
